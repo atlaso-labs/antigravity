@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Atlaso Memory MCP server launcher for Google Antigravity (IDE + CLI `agy`).
+#
+# Antigravity registers MCP servers in ~/.gemini/config/mcp_config.json with an
+# absolute `command` path (no ${...} substitution like Claude Code's plugin root),
+# so the installer points that entry at THIS file's absolute path. One launcher
+# serves all three surfaces (IDE, CLI agy, Antigravity 2.0) — they read the same
+# config file.
+#
+# Dual-mode, auto-detected:
+#   built/installed → vendored runtime/ on a uv-managed Python (self-contained)
+#   dev/in-repo     → the SDK venv + platform siblings
+#
+# Reuses the shared mcp/atlaso_mcp server UNCHANGED. Emits NO stray stdout — the
+# only thing on stdout is the MCP JSON-RPC stream (any noise breaks the protocol).
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOL_DIR="$(cd "$HERE/.." && pwd)"
+
+# ATLASO_TOOL tags this connector for per-device tool entitlement (free = 1 active
+# tool/device). Written as a LITERAL in mcp_config.json by the installer too;
+# exported here as a belt-and-braces default so the right tool id travels with the
+# process even if the config entry omits it.
+export ATLASO_TOOL="${ATLASO_TOOL:-antigravity}"
+
+if [ -d "$TOOL_DIR/runtime" ]; then
+  command -v uv >/dev/null 2>&1 || { echo "atlaso-mcp: uv is required to run the memory server" >&2; exit 1; }
+  cd "$TOOL_DIR/runtime" && exec uv run --quiet python -m atlaso_mcp
+else
+  PLATFORM="$(cd "$TOOL_DIR/../.." && pwd)"
+  PY="${ATLASO_PY:-$PLATFORM/sdk/.venv/bin/python}"
+  [ -x "$PY" ] || { echo "atlaso-mcp: python interpreter not found at $PY" >&2; exit 1; }
+  exec env PYTHONPATH="$PLATFORM/mcp:$PLATFORM/client${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m atlaso_mcp
+fi

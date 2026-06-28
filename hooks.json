@@ -1,0 +1,11 @@
+{
+  "atlaso": {
+    "enabled": true,
+    "PreInvocation": [
+      { "type": "command", "command": "./hooks/recall.sh", "timeout": 15 }
+    ],
+    "Stop": [
+      { "type": "command", "command": "./hooks/capture.sh", "timeout": 30 }
+    ]
+  }
+}
