@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 # Production brain (overridable). Matches the SDK's _connect.DEFAULT_SERVER.
-DEFAULT_SERVER = os.environ.get("ATLASO_SERVER", "https://api.atlaso.ai")
+DEFAULT_SERVER = os.environ.get("ATLASO_SERVER", "https://mcp.atlaso.ai")
 
 
 def atlaso_dir() -> Path:
