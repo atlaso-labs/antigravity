@@ -18,8 +18,8 @@ from __future__ import annotations
 import uuid
 from typing import Any, Optional
 
-from . import config, state
-from .api import AuthRejected, BrainAPI
+from . import _credential, _telemetry, config, state
+from .api import AuthRejected, BrainAPI, EdgeBlocked, NotEntitled
 from .cache import Cache
 
 # Safety valve: never let a connector's per-turn call balloon. The server caps
@@ -57,6 +57,11 @@ class Client:
         # This machine's device_id (from auth.json). With `tool`, it scopes the
         # cached cloud-link verdict so a different tool/device never inherits it.
         self._device_id = (config.load_auth() or {}).get("device_id")
+        # Which credential file backed this session's token ("own" = this tool's, so a
+        # 401 retires only IT; "shared" = the legacy bearer, which we must never delete
+        # out from under the machine's other integrations).
+        self._cred_source: str | None = None
+        self._cred_token: str | None = None
         if api is not None:
             self.api = api
         elif _auto_api:
@@ -64,16 +69,41 @@ class Client:
         else:
             self.api = None
 
-    @staticmethod
-    def _resolve_api(server: str | None, token: str | None) -> Optional[BrainAPI]:
-        if not (server and token):
-            auth = config.load_auth() or {}
-            server = server or auth.get("server") or config.DEFAULT_SERVER
-            token = token or auth.get("token")
-        if not (server and token):
-            return None  # not connected → offline mode
+    def _resolve_api(self, server: str | None, token: str | None) -> Optional[BrainAPI]:
+        if server and token:  # explicit override (tests / embedding)
+            try:
+                return BrainAPI(server, token)
+            except Exception:
+                return None
         try:
-            return BrainAPI(server, token)
+            cred = _credential.resolve(self.tool)
+        except _credential.ToolRemoved:
+            # The user removed this tool from this device. Go quiet — do NOT fall back
+            # to the shared bearer, which would resurrect exactly what they removed.
+            state.set_local_only(state.AUTH_REJECTED, tool=self.tool,
+                                 device_id=self._device_id)
+            return None
+        except _credential.ToolNotEntitled:
+            # Free plan, another tool holds the slot. Local-only — and NOT on the
+            # shared bearer, which would let this tool masquerade as the entitled one.
+            state.set_local_only(state.NOT_ENTITLED, tool=self.tool,
+                                 device_id=self._device_id)
+            return None
+        except Exception:
+            cred = None
+        if not cred or not cred.get("token"):
+            return None  # not connected → offline mode
+        self._cred_source = cred.get("source")
+        self._cred_token = cred.get("token")
+        # A FRESHLY MINTED credential must not inherit the dead one's punishment. The
+        # run that got the 401 wrote an auth_rejected verdict with a 1-hour TTL; without
+        # this, the next run — now holding a brand-new working credential — would keep
+        # suppressing cloud sync for the rest of that hour, and a paying user would see
+        # an outage we had already fixed. Forget the verdict; the next op re-verifies.
+        if cred.get("minted"):
+            state.invalidate()
+        try:
+            return BrainAPI(cred.get("server") or config.DEFAULT_SERVER, cred["token"])
         except Exception:
             return None
 
@@ -99,10 +129,31 @@ class Client:
         return st
 
     def _note_auth_failure(self, exc: BaseException) -> None:
-        """A reachable brain rejected our token (401/403) → go LOCAL-ONLY until the
-        user reconnects. Transport errors are transient and are ignored here."""
+        """Map a transport exception onto persisted cloud-link state. ONLY verified
+        app verdicts move state: AuthRejected → auth_rejected/reconnect_required
+        (TTL'd, self-healing), NotEntitled → not_entitled (soft, short TTL).
+        EdgeBlocked (a WAF/edge 403 that is NOT verifiably ours) and every other
+        transport error are TRANSIENT: state untouched, items stay queued — the
+        exact discipline whose absence once let a Cloudflare block page silently
+        kill all sync as a fake 'revoked'."""
         if isinstance(exc, AuthRejected):
-            state.set_local_only(state.REVOKED, tool=self.tool, device_id=self._device_id)
+            reason = (state.RECONNECT_REQUIRED if exc.code == "reconnect_required"
+                      else state.AUTH_REJECTED)
+            state.set_local_only(reason, tool=self.tool, device_id=self._device_id)
+            _telemetry.log("auth", "auth_rejected", code=exc.code, tool=self.tool)
+            # Retire ONLY the credential that was actually rejected. If this tool had
+            # its own and it died (the user removed the tool, or it rotated), drop that
+            # file so the next run re-bootstraps — and gets told to stay down if it was
+            # revoked. Never delete the shared bearer: the machine's other integrations
+            # are still riding it.
+            if self._cred_source:
+                _credential.retire(self.tool, self._cred_source, self._cred_token)
+        elif isinstance(exc, NotEntitled):
+            state.set_local_only(state.NOT_ENTITLED, tool=self.tool, device_id=self._device_id)
+            _telemetry.log("auth", "not_entitled", tool=self.tool)
+        elif isinstance(exc, EdgeBlocked):
+            _telemetry.log("transport", "edge_block", status=exc.status,
+                           cf_ray=exc.cf_ray, content_type=exc.content_type, tool=self.tool)
 
     def _online(self) -> bool:
         """Should we attempt a cloud call right now? True only when we have a token
@@ -117,11 +168,11 @@ class Client:
             st = state.get()
             mine = state.matches(st, self.tool, self._device_id)
             if st.get("mode") == state.LOCAL_ONLY:
-                # Trust a local-only verdict only for the SAME identity: 'revoked'
-                # is sticky until reconnect; 'not_entitled' re-checks once stale
-                # (a dashboard plan/active-tool change). A foreign verdict re-verifies.
-                if mine and st.get("reason") == state.REVOKED:
-                    return False
+                # Trust a local-only verdict only for the SAME identity and only
+                # while FRESH (per-reason TTL: auth rejections 1h, entitlement
+                # 10min). NO verdict is forever-sticky — once stale we re-verify
+                # quietly, so a wrong flip self-heals instead of killing sync
+                # until a manual reconnect. Foreign verdicts always re-verify.
                 if mine and state.is_fresh(st):
                     return False
                 return self._verify_entitlement()
@@ -142,17 +193,17 @@ class Client:
         tool, did = self.tool, self._device_id
         try:
             ent = self.api.entitlement()
-        except AuthRejected:
-            state.set_local_only(state.REVOKED, tool=tool, device_id=did)
+        except AuthRejected as e:
+            self._note_auth_failure(e)
             return False
         except Exception:
-            # Transient (offline/5xx): we couldn't VERIFY entitlement, so we must
-            # not grant a cloud window to an unverified identity (the server doesn't
-            # gate by tool). Stay local this turn, leave state unchanged → retry
-            # verification next time.
+            # Transient (offline/5xx/edge-block): we couldn't VERIFY entitlement, so
+            # we must not grant a cloud window to an unverified identity (the server
+            # doesn't gate by tool). Stay local this turn, leave state unchanged →
+            # retry verification next time.
             return False
         if ent.get("needs_reconnect"):
-            state.set_local_only(state.REVOKED, tool=tool, device_id=did)
+            state.set_local_only(state.RECONNECT_REQUIRED, tool=tool, device_id=did)
             return False
         # Downgrade grace: the brain keeps multi-tool sync alive for a short
         # window after a paid→free drop and reports it here so each tool can show
@@ -171,8 +222,8 @@ class Client:
             try:
                 claimed = self.api.claim_tool(self.tool)
                 active = claimed.get("active_tool")
-            except AuthRejected:
-                state.set_local_only(state.REVOKED, tool=tool, device_id=did)
+            except AuthRejected as e:
+                self._note_auth_failure(e)
                 return False
             except Exception:
                 return False  # transient — stay local, retry verification next time
@@ -406,23 +457,25 @@ class Client:
             pass
         return {"pushed": pushed, "pulled": pulled}
 
-    def _push(self) -> dict:
-        """Drain the outbox via batch deposit. Returns {client_id: server_id} for
-        every item the server settled (added or duplicate) — callers use it to learn
-        the durable id. Adopts the server's (scrubbed) canonical text into the cache."""
-        items = self.cache.list_outbox(limit=_PUSH_BATCH)
-        if not items:
-            return {}
-        payload = [
-            {
-                "client_id": it["client_id"], "text": it["text"], "polarity": it["polarity"],
-                "evidence_grade": it["evidence_grade"], "scope_note": it["scope_note"],
-                "tags": it["tags"],
-            }
-            for it in items
-        ]
-        resp = self.api.deposit_batch(payload)
-        mapping: dict[str, str] = {}
+    @staticmethod
+    def _item_payload(it: dict, *, b64: bool = False) -> dict:
+        p = {
+            "client_id": it["client_id"], "polarity": it["polarity"],
+            "evidence_grade": it["evidence_grade"], "scope_note": it["scope_note"],
+            "tags": it["tags"],
+        }
+        if b64:
+            # WAF fallback: the plain text pattern-matched an edge rule; base64
+            # denies the lexical match (the server decodes; content unchanged).
+            import base64 as _b64
+            p["text_b64"] = _b64.b64encode(it["text"].encode("utf-8")).decode("ascii")
+        else:
+            p["text"] = it["text"]
+        return p
+
+    def _apply_results(self, resp: dict, mapping: dict) -> None:
+        """Settle server per-item results into the outbox/cache (shared by the
+        batch path and the per-item fallback path)."""
         for res in resp.get("results", []):
             cid = res.get("client_id")
             if not cid:
@@ -438,9 +491,119 @@ class Client:
             elif status in ("rejected", "invalid"):
                 # the server's gate refused it — drop the optimistic local row
                 self.cache.resolve_outbox(cid, dropped=True)
+                _telemetry.log("push", "server_refused", client_id=cid, status=status)
             else:  # "error"/"pending"/unknown → leave queued, count the attempt
                 self.cache.bump_attempt(cid)
+
+    # An item is quarantined after this many INDIVIDUAL edge/WAF blocks (each one
+    # already retried once more as base64). Poison must never wedge the queue.
+    _EDGE_QUARANTINE_AFTER = 2
+    # Per-item fallback aborts after this many CONSECUTIVE transient failures —
+    # if the server/network is down, iterating the whole outbox is just noise.
+    _TRANSIENT_ABORT_AFTER = 3
+
+    def _push(self) -> dict:
+        """Drain the outbox. Fast path: one batch deposit. If the BATCH request
+        itself fails for a non-auth reason (edge/WAF block, 5xx, timeout), fall
+        back to item-by-item delivery so one poisoned item can't hold the rest
+        hostage — the exact failure mode of the Cloudflare incident. Verified app
+        auth verdicts (AuthRejected/NotEntitled) propagate to the caller.
+        Returns {client_id: server_id} for every settled item."""
+        items = self.cache.list_outbox(limit=_PUSH_BATCH)
+        if not items:
+            return {}
+        mapping: dict[str, str] = {}
+        try:
+            resp = self.api.deposit_batch([self._item_payload(it) for it in items])
+        except (AuthRejected, NotEntitled):
+            raise  # a verified app verdict — no point retrying per-item
+        except Exception as e:
+            _telemetry.log("push", "batch_failed", error=type(e).__name__,
+                           status=getattr(e, "status", None),
+                           cf_ray=getattr(e, "cf_ray", None), items=len(items))
+            self._push_each(items, mapping)
+            return mapping
+        self._apply_results(resp, mapping)
+        _telemetry.log("push", "push_ok", items=len(items), settled=len(mapping))
         return mapping
+
+    def _push_each(self, items: list[dict], mapping: dict) -> None:
+        """Item-by-item fallback after a failed batch. Delivery semantics:
+          • verified app auth verdict → stop (state transition upstream)
+          • edge/WAF block → count it; retry once as base64; still blocked at the
+            threshold → QUARANTINE (parked locally, never wedges the queue again)
+          • 429 → back off entirely (stop this run)
+          • other transient errors → count the attempt, keep going a little, but
+            abort after a few consecutive failures (server likely down)."""
+        transient_streak = 0
+        for it in items:
+            cid = it["client_id"]
+            try:
+                resp = self.api.deposit_batch([self._item_payload(it)])
+            except (AuthRejected, NotEntitled) as e:
+                self._note_auth_failure(e)
+                return
+            except EdgeBlocked as e:
+                transient_streak = 0
+                # One base64 retry — but its failures must be classified with the
+                # SAME discipline as the first attempt: a verified auth verdict,
+                # 429, or 5xx/timeout on the retry is NOT another edge block and
+                # must never push the item toward quarantine.
+                try:
+                    if self._retry_b64(it, mapping):
+                        continue
+                except (AuthRejected, NotEntitled) as e2:
+                    self._note_auth_failure(e2)
+                    return
+                except EdgeBlocked:
+                    pass  # blocked in b64 form too — falls through to the counter
+                except Exception as e2:
+                    status = getattr(getattr(e2, "response", None), "status_code", None)
+                    if status == 429:
+                        _telemetry.log("push", "rate_limited", client_id=cid)
+                        return
+                    self.cache.bump_attempt(cid)
+                    _telemetry.log("push", "transient_item", client_id=cid,
+                                   error=type(e2).__name__, status=status)
+                    continue  # transient on the retry — item stays queued as-is
+                blocks = self.cache.bump_edge_block(cid)
+                _telemetry.log("push", "edge_block_item", client_id=cid,
+                               status=e.status, cf_ray=e.cf_ray, blocks=blocks)
+                if blocks >= self._EDGE_QUARANTINE_AFTER:
+                    self.cache.quarantine_outbox(cid, "edge_blocked")
+                    _telemetry.log("push", "quarantined", client_id=cid,
+                                   reason="edge_blocked",
+                                   queue=self.cache.counts().get("pending"))
+                continue
+            except Exception as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status == 429:
+                    _telemetry.log("push", "rate_limited", client_id=cid)
+                    return  # back off — let the next sync tick retry everything
+                self.cache.bump_attempt(cid)
+                _telemetry.log("push", "transient_item", client_id=cid,
+                               error=type(e).__name__, status=status)
+                transient_streak += 1
+                if transient_streak >= self._TRANSIENT_ABORT_AFTER:
+                    return  # server/network likely down — stop hammering
+                continue
+            transient_streak = 0
+            self._apply_results(resp, mapping)
+
+    def _retry_b64(self, it: dict, mapping: dict) -> bool:
+        """One base64 retry for an edge-blocked item (denies the WAF its lexical
+        match without changing content). True if the item settled. Exceptions
+        PROPAGATE — the caller classifies them (auth vs 429 vs transient vs
+        another edge block); swallowing them here once misfiled a 429 as an edge
+        block and quarantined a good memory."""
+        resp = self.api.deposit_batch([self._item_payload(it, b64=True)])
+        before = len(mapping)
+        self._apply_results(resp, mapping)
+        settled = len(mapping) > before or not any(
+            o["client_id"] == it["client_id"] for o in self.cache.list_outbox(limit=_PUSH_BATCH))
+        if settled:
+            _telemetry.log("push", "b64_rescued", client_id=it["client_id"])
+        return settled
 
     def _pull(self) -> int:
         pulled = 0

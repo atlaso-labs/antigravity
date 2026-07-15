@@ -36,7 +36,8 @@ def is_recursive() -> bool:
 
 
 # This connector's tool id — must match the agent id the web app / brain use.
-TOOL = "antigravity"
+# Overridable via ATLASO_TOOL for testing/forward-compat (mirrors the codex shim).
+TOOL = os.environ.get("ATLASO_TOOL") or "antigravity"
 
 
 def make_client():
@@ -56,7 +57,7 @@ def maybe_autoconnect() -> bool:
     try:
         from atlaso_client.connect import maybe_autoconnect as _mc
 
-        return _mc()
+        return _mc(TOOL)
     except Exception:
         return False
 

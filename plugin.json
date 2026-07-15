@@ -1,4 +1,5 @@
 {
   "name": "atlaso",
+  "version": "0.1.0",
   "description": "Atlaso — persistent memory for Antigravity (auto recall + capture, MCP tools, skill, rules)."
 }

@@ -31,7 +31,14 @@ def do_remember(client, text: str) -> dict[str, Any]:
     text = (text or "").strip()
     if not text:
         return {"saved": False, "error": "empty text"}
-    cid = client.remember(text)
+    # `manual` = explicit user remember → UNTOUCHABLE by L2 enrichment (the
+    # server enricher's manual guard keys on this tag). Also tag the canonical
+    # tool id for attribution when the client knows it.
+    tags = ["manual"]
+    tool = getattr(client, "tool", None)
+    if tool:
+        tags.insert(0, str(tool))
+    cid = client.remember(text, tags=tags)
     return {"saved": True, "id": cid}
 
 

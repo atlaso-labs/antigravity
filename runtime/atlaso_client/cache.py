@@ -49,9 +49,32 @@ CREATE TABLE IF NOT EXISTS outbox (
     scope_note     TEXT,
     tags_json      TEXT NOT NULL DEFAULT '[]',
     created_at     TEXT NOT NULL,
-    attempts       INTEGER NOT NULL DEFAULT 0
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    edge_blocks    INTEGER NOT NULL DEFAULT 0
+);
+
+-- Items that repeatedly fail to deliver for a NON-transient reason (edge/WAF
+-- block, oversize) are PARKED here instead of wedging the outbox forever
+-- (one poisoned item must never block the batch). The optimistic row in
+-- cached_deposits STAYS, so the memory remains locally recallable.
+CREATE TABLE IF NOT EXISTS quarantine (
+    client_id      TEXT PRIMARY KEY,
+    text           TEXT NOT NULL,
+    polarity       TEXT NOT NULL DEFAULT 'open',
+    evidence_grade TEXT NOT NULL DEFAULT 'anecdotal',
+    scope_note     TEXT,
+    tags_json      TEXT NOT NULL DEFAULT '[]',
+    created_at     TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    quarantined_at TEXT NOT NULL
 );
 """
+
+# Additive column migrations for caches created by older clients. Applied
+# opportunistically at open; "duplicate column" errors mean already-migrated.
+_MIGRATIONS = (
+    "ALTER TABLE outbox ADD COLUMN edge_blocks INTEGER NOT NULL DEFAULT 0",
+)
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
@@ -81,6 +104,11 @@ class Cache:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        for mig in _MIGRATIONS:
+            try:
+                self._conn.execute(mig)
+            except sqlite3.OperationalError:
+                pass  # already migrated (duplicate column) — expected
         self._conn.commit()
 
     def close(self) -> None:
@@ -186,7 +214,8 @@ class Cache:
 
     def list_outbox(self, limit: int = 100) -> list[dict]:
         rows = self._conn.execute(
-            "SELECT client_id, text, polarity, evidence_grade, scope_note, tags_json, attempts "
+            "SELECT client_id, text, polarity, evidence_grade, scope_note, tags_json, "
+            "attempts, edge_blocks, created_at "
             "FROM outbox ORDER BY created_at LIMIT ?",
             (limit,),
         ).fetchall()
@@ -200,12 +229,52 @@ class Cache:
                 "client_id": r["client_id"], "text": r["text"], "polarity": r["polarity"],
                 "evidence_grade": r["evidence_grade"], "scope_note": r["scope_note"],
                 "tags": tags, "attempts": r["attempts"],
+                "edge_blocks": r["edge_blocks"], "created_at": r["created_at"],
             })
         return out
 
     def bump_attempt(self, client_id: str) -> None:
         self._conn.execute("UPDATE outbox SET attempts = attempts + 1 WHERE client_id = ?", (client_id,))
         self._conn.commit()
+
+    def bump_edge_block(self, client_id: str) -> int:
+        """Count an INDIVIDUAL edge/WAF block against this item. Returns the new
+        count — the caller quarantines once it crosses the threshold."""
+        self._conn.execute(
+            "UPDATE outbox SET edge_blocks = edge_blocks + 1, attempts = attempts + 1 "
+            "WHERE client_id = ?", (client_id,))
+        self._conn.commit()
+        r = self._conn.execute(
+            "SELECT edge_blocks FROM outbox WHERE client_id = ?", (client_id,)).fetchone()
+        return int(r["edge_blocks"]) if r else 0
+
+    def quarantine_outbox(self, client_id: str, reason: str) -> None:
+        """Park a poisoned outbox item so it can never wedge the queue again. The
+        optimistic cached_deposits row is DELIBERATELY kept (still recallable
+        locally) — quarantine is about delivery, not about the memory itself."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO quarantine"
+            "(client_id, text, polarity, evidence_grade, scope_note, tags_json, "
+            " created_at, reason, quarantined_at) "
+            "SELECT client_id, text, polarity, evidence_grade, scope_note, tags_json, "
+            "       created_at, ?, ? FROM outbox WHERE client_id = ?",
+            (reason, _now_iso(), client_id),
+        )
+        self._conn.execute("DELETE FROM outbox WHERE client_id = ?", (client_id,))
+        self._conn.commit()
+
+    def list_quarantine(self, limit: int = 100) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT client_id, reason, quarantined_at, created_at FROM quarantine "
+            "ORDER BY quarantined_at DESC LIMIT ?", (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def oldest_pending_at(self) -> str | None:
+        """created_at of the oldest queued item (ISO), or None when empty — used
+        by the flush debounce to force a push when items are going stale."""
+        r = self._conn.execute("SELECT min(created_at) AS m FROM outbox").fetchone()
+        return r["m"] if r and r["m"] else None
 
     def resolve_outbox(
         self, client_id: str, *, server_id: str | None = None,
@@ -301,10 +370,11 @@ class Cache:
         return out
 
     def remove(self, deposit_id: str) -> None:
-        """Drop a memory from the cache + outbox (used by forget)."""
+        """Drop a memory from the cache + outbox + quarantine (used by forget)."""
         self._conn.execute("DELETE FROM cached_deposits WHERE id = ?", (deposit_id,))
         self._conn.execute("DELETE FROM cached_fts WHERE deposit_id = ?", (deposit_id,))
         self._conn.execute("DELETE FROM outbox WHERE client_id = ?", (deposit_id,))
+        self._conn.execute("DELETE FROM quarantine WHERE client_id = ?", (deposit_id,))
         self._conn.commit()
 
     # ── introspection (for connectors / status / debugging) ──────────────────
@@ -313,4 +383,6 @@ class Cache:
             "SELECT count(*) AS n FROM cached_deposits WHERE retracted = 0"
         ).fetchone()["n"]
         pending = self._conn.execute("SELECT count(*) AS n FROM outbox").fetchone()["n"]
-        return {"cached": int(total), "pending": int(pending), "cursor": self.get_cursor()}
+        quarantined = self._conn.execute("SELECT count(*) AS n FROM quarantine").fetchone()["n"]
+        return {"cached": int(total), "pending": int(pending),
+                "quarantined": int(quarantined), "cursor": self.get_cursor()}

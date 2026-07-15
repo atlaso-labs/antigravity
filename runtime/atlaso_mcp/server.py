@@ -1,4 +1,4 @@
-"""Atlaso memory MCP server (the `memory` server in the `atlaso` plugin).
+"""Atlaso memory MCP server (the `Atlaso` server in the `atlaso` plugin).
 
 Exposes a lean set of DELIBERATE memory tools over MCP, backed by the shared thin
 client (``atlaso_client.Client``). The smart engine stays server-side; this just
@@ -8,6 +8,8 @@ Desktop, Codex, Cursor, etc.
 Run:  python -m atlaso_mcp        (stdio)
 """
 from __future__ import annotations
+
+import os
 
 from mcp.server.fastmcp import FastMCP
 
@@ -33,16 +35,27 @@ INSTRUCTIONS = (
     "how to use it."
 )
 
-mcp = FastMCP("memory", instructions=INSTRUCTIONS)
+# serverInfo.name — the server's self-reported identity. "Atlaso" is on-brand and matches
+# the config-key each connector registers ("Atlaso" for Codex/Antigravity). Claude Code
+# still keys its tool namespace + allowlist off ITS config key ("memory" → plugin:atlaso:memory),
+# which is independent of this — so this rename doesn't touch CC's tool ids.
+mcp = FastMCP("Atlaso", instructions=INSTRUCTIONS)
 
 _client: Client | None = None
 
 
 def client() -> Client:
-    """Lazily build one shared client (warm keep-alive connection + cache)."""
+    """Lazily build one shared client (warm keep-alive connection + cache).
+
+    Tag it with this connector's tool id (from ATLASO_TOOL, set by the launcher — e.g.
+    Antigravity's bin exports ATLASO_TOOL=antigravity) so the DELIBERATE MCP tools go
+    through the SAME per-tool entitlement/tombstone gate the hooks use. Without a tool,
+    the client resolves the shared bearer and skips per-tool gating — so a revoked or
+    free-plan-gated tool could recall/remember via MCP when its hooks can't. None (env
+    unset, e.g. older launchers) preserves the previous tool-agnostic behavior."""
     global _client
     if _client is None:
-        _client = Client()
+        _client = Client(tool=os.environ.get("ATLASO_TOOL") or None)
     return _client
 
 

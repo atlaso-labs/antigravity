@@ -27,11 +27,50 @@ _SIGNAL = re.compile(
 )
 MIN_WORDS = 4
 
+# System/harness-generated turns are NOT the user speaking — task notifications,
+# agent-to-agent mail, slash-command echoes, image-attachment stubs. They are
+# worthless as memories (free users have NO server-side enricher to clean them up)
+# AND their markup is what pattern-matches Cloudflare WAF rules and gets whole
+# deposit batches blocked at the edge. Gate them out at the source.
+_SYSTEM_TURN_PREFIXES = (
+    "<task-notification>",
+    "<teammate-message",
+    "<agent-message",
+    "<local-command-caveat>",
+    "<command-name>",
+    "<command-message>",
+    "<local-command-stdout>",
+    "<system-reminder>",
+    "[Image: source:",
+    "[Image #",
+    # The harness prepends prose BEFORE the tag on inter-agent mail and system
+    # notifications — the bare-tag prefixes above never see it (leaked live
+    # 2026-07-13: "Another Claude session sent a message: <teammate-message…"
+    # rows reached the dashboard).
+    "Another Claude session sent a message:",
+    "[SYSTEM NOTIFICATION",
+)
+
+# Auto-capture size cap. Longer user turns are almost always pasted logs/docs/
+# diffs — junk as a memory and hostile to the WAF's body-inspection window. The
+# EXPLICIT paths (MCP remember / manual) are not capped by this — only the
+# ambient per-turn capture.
+MAX_CAPTURE_CHARS = 4000
+
+
+def is_system_turn(text: str) -> bool:
+    t = (text or "").lstrip()
+    return any(t.startswith(p) for p in _SYSTEM_TURN_PREFIXES)
+
 
 def should_deposit(user_text: str) -> tuple[bool, str]:
     t = (user_text or "").strip()
     if not t:
         return False, "empty"
+    if is_system_turn(t):
+        return False, "system_turn"
+    if len(t) > MAX_CAPTURE_CHARS:
+        return False, "too_long"
     if _CHATTER.match(t):
         return False, "chatter"
     if _SIGNAL.search(t):

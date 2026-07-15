@@ -28,13 +28,31 @@ from . import config
 # between checks while still picking up a dashboard plan/active-tool change.
 ENTITLEMENT_TTL = int(os.environ.get("ATLASO_ENTITLEMENT_TTL", "600"))  # 10 min
 
+# How long an AUTH-REJECTED verdict is trusted before ONE quiet re-verification.
+# NO verdict is forever-sticky anymore: a false flip (e.g. a misclassified edge
+# block on an old client, or a server-side hiccup) self-heals within this window
+# instead of silently killing sync until a manual reconnect.
+AUTH_TTL = int(os.environ.get("ATLASO_AUTH_TTL", "3600"))  # 1 h
+
 LINKED = "linked"
 LOCAL_ONLY = "local_only"
 
 # reasons for LOCAL_ONLY
-REVOKED = "revoked"              # token rejected by a reachable brain (disconnected/expired)
-NOT_ENTITLED = "not_entitled"   # tool isn't the active tool on a free plan
-NOT_CONNECTED = "not_connected"  # never linked (no token)
+REVOKED = "revoked"                        # legacy alias (state files written by old clients)
+AUTH_REJECTED = "auth_rejected"            # app verified the token invalid/expired
+RECONNECT_REQUIRED = "reconnect_required"  # app says this device must reconnect
+NOT_ENTITLED = "not_entitled"              # tool isn't the active tool on a free plan
+NOT_CONNECTED = "not_connected"            # never linked (no token)
+
+# Reasons that stem from a verified credential rejection → the longer TTL.
+_AUTH_REASONS = (REVOKED, AUTH_REJECTED, RECONNECT_REQUIRED)
+
+
+def ttl_for(reason: str | None) -> int:
+    """Freshness window for a persisted verdict, by reason. Auth rejections are
+    trusted longer (don't hammer a dead token) but still expire; everything else
+    uses the entitlement TTL so plan changes surface quickly."""
+    return AUTH_TTL if reason in _AUTH_REASONS else ENTITLEMENT_TTL
 
 
 def _path() -> Path:
@@ -130,8 +148,10 @@ def matches(st: dict, tool: Optional[str], device_id: Optional[str]) -> bool:
 
 
 def is_fresh(st: dict) -> bool:
-    """Has the current verdict been verified within the TTL? Malformed → not fresh."""
+    """Has the current verdict been verified within its reason's TTL? Malformed →
+    not fresh (forces a re-verification, the safe default)."""
     try:
-        return (int(time.time()) - int(st.get("checked_at") or 0)) < ENTITLEMENT_TTL
+        age = int(time.time()) - int(st.get("checked_at") or 0)
+        return age < ttl_for(st.get("reason"))
     except (TypeError, ValueError):
         return False

@@ -1,32 +1,4 @@
-# Atlaso — memory for Antigravity
-
-**Automatic long-term memory for Google Antigravity** — recall before each turn
-and capture after, in both the IDE and the `agy` CLI, via one native plugin.
-
-## Install
-
-1. Create a free account at [app.atlaso.ai](https://app.atlaso.ai/sign-in) and
-   follow the connect flow for Antigravity, then:
-
-```
-agy plugin install https://github.com/atlaso-labs/antigravity
-```
-
-**What you get**
-
-- One memory across every AI tool you use — what Antigravity learns, Cursor, Codex, and the rest already know
-- Personal memory that follows you, plus per-project memory keyed to each repo
-- Secrets scrubbed client-side before anything is stored; your memory is never trained on or sold
-- Free for one device and one tool — no credit card ([pricing](https://www.atlaso.ai/pricing))
-
-**Links:** [Why Atlaso for Antigravity](https://www.atlaso.ai/for/antigravity) ·
-[Setup guide](https://docs.atlaso.ai/tools/antigravity) ·
-[What is an AI memory layer?](https://www.atlaso.ai/what-is-an-ai-memory-layer) ·
-[Dashboard](https://app.atlaso.ai/sign-in)
-
----
-
-## How it's built (for the curious)
+# Atlaso × Google Antigravity
 
 The [Atlaso](https://atlaso.ai) memory connector for **Google Antigravity** — the
 IDE, the CLI (`agy`), and Antigravity 2.0 — shipped as a **native Antigravity
@@ -43,23 +15,28 @@ packaging + lifecycle hooks.
 
 Antigravity has a real third-party plugin format: a namespaced bundle marked by a
 `plugin.json` at its root, grouping **skills, rules, MCP servers, and hooks** in
-ONE package. Antigravity **auto-scans** its plugin directories to discover and load
-plugins, so there is no CLI step and no marketplace — installing is just placing the
-bundle directory at the scanned path:
+ONE package. On **agy 1.0.14** a plugin must be **registered** — `agy plugin install
+<dir>` copies the bundle into `~/.gemini/config/plugins/atlaso/` and records it in
+`~/.gemini/config/import_manifest.json` (a raw file-drop into the plugins dir is
+**not** auto-loaded, and there is no git-URL / `owner/repo` install form — both are
+read as directory paths and fail). There is no public plugin marketplace to submit
+to. One install covers the IDE and the `agy` CLI (they share `~/.gemini`).
+
+`install.py` builds the self-contained bundle and registers it via `agy plugin
+install`; the `atlaso` CLI does the same headlessly (materialises the embedded
+bundle to a temp dir, then `agy plugin install <dir>`). Installed at:
 
 | Scope | Plugin directory |
 |---|---|
 | **Global** | `~/.gemini/config/plugins/atlaso/` |
 | **Project** | `<workspace>/.agents/plugins/atlaso/` |
 
-`install.py` copies our self-contained bundle into the **global** location.
-
 ### What's in the bundle
 
 ```
 ~/.gemini/config/plugins/atlaso/
   plugin.json                REQUIRED marker  {"name":"atlaso", ...}
-  mcp_config.json            the atlaso MCP server (recall/remember/forget/recent/status)
+  mcp_config.json            the Atlaso MCP server (recall/remember/forget/recent/status)
   hooks.json                 PreInvocation → recall.sh, Stop → capture.sh
   skills/memory/SKILL.md     model-driven memory skill (when to recall/deposit)
   rules/atlaso.md            standing recall-before-answering / remember-durable rule

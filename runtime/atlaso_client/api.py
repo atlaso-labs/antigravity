@@ -13,17 +13,62 @@ import httpx
 
 
 class AuthRejected(Exception):
-    """The brain was REACHED and rejected the token (HTTP 401/403) — the device
-    was disconnected, or the token expired/revoked. Distinct from a transport
-    error (offline / timeout / 5xx), which is transient. The core treats this as
-    the authoritative signal to switch to LOCAL-ONLY until the user reconnects."""
+    """OUR app verifiably rejected the credential (401/403 carrying the Atlaso
+    response marker + a state-transition error code). The core switches this
+    identity to LOCAL-ONLY (with a TTL, so a wrong verdict self-heals).
+    `code` is the server's machine-readable reason: "invalid_token" or
+    "reconnect_required"."""
+
+    def __init__(self, message: str, *, code: str = "invalid_token"):
+        super().__init__(message)
+        self.code = code
+
+
+class NotEntitled(Exception):
+    """OUR app said this tool isn't entitled on the current (free) plan — a plan
+    POLICY verdict, not an auth failure. The core parks the tool as not_entitled
+    (soft; re-checked on a short TTL). Never treated like a revoked credential."""
+
+
+class EdgeBlocked(Exception):
+    """A 401/403 that is NOT verifiably from our app — most commonly Cloudflare's
+    WAF blocking a request whose body pattern-matched an attack (code/markup in a
+    legit memory). TRANSIENT by definition: the item stays queued and sticky auth
+    state is NEVER touched. Carries edge evidence for telemetry."""
+
+    def __init__(self, message: str, *, status: int = 0,
+                 cf_ray: str | None = None, content_type: str | None = None):
+        super().__init__(message)
+        self.status = status
+        self.cf_ray = cf_ray
+        self.content_type = content_type
+
+
+# State-transition codes the client acts on. Anything else on a verified 401/403
+# (an unknown future code) fails SAFE: treated as transient, item stays queued.
+_AUTH_CODES = ("invalid_token", "reconnect_required")
 
 
 def _raise(r: httpx.Response) -> None:
-    """Turn a 401/403 into AuthRejected (a reachable server said 'no'); let every
-    other non-2xx raise the usual httpx.HTTPStatusError (treated as transient)."""
+    """Classify a non-2xx. 401/403 are only an AUTH verdict when the response is
+    POSITIVELY ours (X-Atlaso-Response marker) AND carries a known state-transition
+    code — a Cloudflare/edge block page must never masquerade as 'token revoked'
+    (the bug that silently killed all sync). Header stripped by a proxy → false
+    negative → item stays queued: the correct fail-safe. Every other non-2xx raises
+    httpx.HTTPStatusError (transient)."""
     if r.status_code in (401, 403):
-        raise AuthRejected(f"token rejected ({r.status_code})")
+        if r.headers.get("x-atlaso-response") == "1":
+            code = r.headers.get("x-atlaso-error", "")
+            if code == "not_entitled":
+                raise NotEntitled(f"tool not entitled ({r.status_code})")
+            if code in _AUTH_CODES:
+                raise AuthRejected(f"token rejected ({r.status_code}, {code})", code=code)
+        raise EdgeBlocked(
+            f"unverified {r.status_code} (edge/WAF?)",
+            status=r.status_code,
+            cf_ray=r.headers.get("cf-ray"),
+            content_type=r.headers.get("content-type"),
+        )
     r.raise_for_status()
 
 

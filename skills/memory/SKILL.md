@@ -16,9 +16,9 @@ when_to_use: >-
 
 Atlaso is the user's long-term memory, shared across every tool and project. On
 Antigravity, memory is **model-driven**: there is no automatic per-turn injection,
-so reach for the `atlaso` MCP tools deliberately.
+so reach for the `Atlaso` MCP tools deliberately.
 
-The `atlaso` MCP server exposes: `recall`, `remember`, `forget`, `recent`, `status`.
+The `Atlaso` MCP server exposes: `recall`, `remember`, `forget`, `recent`, `status`.
 
 ## Recall before you answer (the one habit that matters)
 

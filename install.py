@@ -3,18 +3,19 @@
 
 Antigravity has a real plugin format: a namespaced bundle (marked by a
 `plugin.json`) that groups skills, rules, an MCP server, and hooks in ONE package.
-Antigravity AUTO-SCANS its plugin dirs to discover and load plugins, so there is no
-CLI or marketplace to go through — installing is simply placing the bundle dir at:
+On agy 1.0.14 a plugin must be REGISTERED via `agy plugin install <dir>` (a raw
+file-drop into the plugins dir is NOT auto-loaded, and there is no git-URL /
+`owner/repo` install form). This installer builds the self-contained bundle and, if
+`agy` is on PATH, registers it — copying it into and recording it under:
 
-    GLOBAL   ~/.gemini/config/plugins/atlaso/
+    GLOBAL   ~/.gemini/config/plugins/atlaso/  +  ~/.gemini/config/import_manifest.json
     PROJECT  <workspace>/.agents/plugins/atlaso/
 
-This installer copies our self-contained bundle into the GLOBAL location and then
-substitutes the `__ATLASO_PLUGIN_DIR__` placeholder in the installed
-`mcp_config.json` + `hooks.json` with the real absolute install path, so the
-launchers (bin/atlaso-memory-mcp, hooks/recall.sh, hooks/capture.sh) resolve no
-matter where the plugin lives (Antigravity exposes no plugin-root variable for
-hook/MCP commands).
+If `agy` is absent it falls back to a plain file-drop (the Antigravity IDE may pick
+that up, but the agy CLI won't load an unregistered plugin). The file-drop path
+substitutes the `__ATLASO_PLUGIN_DIR__` placeholder in `mcp_config.json` + `hooks.json`
+with the real absolute install path if present (the bundle currently uses relative
+launcher paths, so this is a no-op — Antigravity runs hooks with cwd = the plugin dir).
 
 We no longer merge into the user's shared config files (mcp_config.json /
 hooks.json) or their AGENTS.md — everything (MCP, hooks, skill, rules) lives
@@ -37,6 +38,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -132,10 +134,42 @@ def _make_executable(root: Path) -> None:
                 pass
 
 
+def _agy() -> str | None:
+    """Path to the `agy` CLI, or None. Registration goes through it: on agy 1.0.14 a
+    raw file-drop into the plugins dir is NOT auto-loaded — the plugin must be
+    registered via `agy plugin install <dir>` (which also writes import_manifest.json)."""
+    return shutil.which("agy")
+
+
 def install(dry: bool) -> None:
     src = resolve_bundle_source()
     dst = install_dir()
     print(f"  source bundle: {src}")
+
+    # Preferred path: let `agy` register the plugin (copies it into place +
+    # import_manifest.json). Required for the `agy` CLI on 1.0.14; the IDE also picks
+    # up the registered plugin. Relative launcher paths need no substitution.
+    agy = _agy()
+    if agy:
+        if dry:
+            print(f"  [dry-run] would run: {agy} plugin install {src}")
+            return
+        r = subprocess.run([agy, "plugin", "install", str(src)], capture_output=True, text=True)
+        if r.returncode == 0:
+            print(f"  ✓ registered via agy → {dst}")
+            return
+        # agy present but registration FAILED. Do NOT silently file-drop: on agy 1.0.14
+        # an unregistered file-drop is not loaded, so that would report a dead install as
+        # success. Fail loudly so the real error surfaces.
+        detail = (r.stderr or r.stdout).strip()
+        last = detail.splitlines()[-1] if detail else "unknown error"
+        sys.exit(f"atlaso: `agy plugin install` failed — {last}\n"
+                 f"       (the plugin was NOT installed; fix the above and re-run)")
+
+    # No `agy` on PATH → file-drop the bundle (the Antigravity IDE may pick it up, but the
+    # agy CLI won't load an unregistered plugin — install `agy` and re-run for CLI support).
+    print("  ! `agy` not on PATH — writing a file-drop (Antigravity IDE only; the agy CLI "
+          "won't load it until you install `agy` and re-run)")
     if dry:
         print(f"  [dry-run] would replace {dst}")
         print(f"  [dry-run] would substitute {PLACEHOLDER} → {dst} "
@@ -168,6 +202,17 @@ def install(dry: bool) -> None:
 
 def uninstall(dry: bool) -> None:
     dst = install_dir()
+    agy = _agy()
+    if agy:
+        if dry:
+            print(f"  [dry-run] would run: {agy} plugin uninstall {PLUGIN_NAME}")
+            return
+        subprocess.run([agy, "plugin", "uninstall", PLUGIN_NAME], capture_output=True, text=True)
+        # belt-and-braces: remove any leftover dir so the hooks truly stop
+        if dst.exists():
+            shutil.rmtree(dst, ignore_errors=True)
+        print(f"  ✗ unregistered via agy + removed {dst}")
+        return
     if not dst.exists():
         print(f"  no plugin at {dst} — nothing to remove")
         return
