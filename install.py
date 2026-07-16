@@ -40,6 +40,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -148,13 +149,29 @@ def install(dry: bool) -> None:
 
     # Preferred path: let `agy` register the plugin (copies it into place +
     # import_manifest.json). Required for the `agy` CLI on 1.0.14; the IDE also picks
-    # up the registered plugin. Relative launcher paths need no substitution.
+    # up the registered plugin.
+    #
+    # We stage a copy and substitute __ATLASO_PLUGIN_DIR__ → the FINAL install path
+    # FIRST: agy runs hooks with cwd=the plugin dir (so their `./hooks/…` resolve), but
+    # it runs the MCP server from a DIFFERENT cwd, so the MCP `command` MUST be absolute
+    # (a relative `./bin/…` gives `fork/exec: no such file or directory`). agy copies the
+    # staged dir verbatim to `dst`, so the absolute path we bake in points at the real
+    # installed launcher.
     agy = _agy()
     if agy:
         if dry:
-            print(f"  [dry-run] would run: {agy} plugin install {src}")
+            print(f"  [dry-run] would substitute {PLACEHOLDER} → {dst}, then: {agy} plugin install <staged>")
             return
-        r = subprocess.run([agy, "plugin", "install", str(src)], capture_output=True, text=True)
+        staging_root = Path(tempfile.mkdtemp(prefix="atlaso-ag-"))
+        staging = staging_root / PLUGIN_NAME
+        try:
+            shutil.copytree(src, staging, ignore=shutil.ignore_patterns(
+                "__pycache__", "*.pyc", ".pytest_cache", "dist", ".venv"))
+            _substitute_placeholders(staging, dst)
+            _make_executable(staging)
+            r = subprocess.run([agy, "plugin", "install", str(staging)], capture_output=True, text=True)
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
         if r.returncode == 0:
             print(f"  ✓ registered via agy → {dst}")
             return

@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "Atlaso": {
-      "command": "./bin/atlaso-memory-mcp",
+      "command": "__ATLASO_PLUGIN_DIR__/bin/atlaso-memory-mcp",
       "args": [],
       "env": { "ATLASO_TOOL": "antigravity" }
     }
