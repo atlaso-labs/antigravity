@@ -10,6 +10,7 @@ Run:  python -m atlaso_mcp        (stdio)
 from __future__ import annotations
 
 import os
+from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 
@@ -70,13 +71,22 @@ def recall(query: str, limit: int = 5) -> dict:
 
 
 @mcp.tool()
-def remember(text: str) -> dict:
+def remember(
+    text: str,
+    polarity: Literal["positive", "negative", "cautionary", "open"],
+) -> dict:
     """Save a note to the user's Atlaso memory.
 
     Use this when something specifically should be remembered — a decision,
     preference, or gotcha worth keeping for next time. Returns the new id.
+
+    polarity (required) — which bucket this memory belongs to:
+      · positive — "an affirmed preference, adopted tool, active decision, or standing fact"
+      · open — "genuinely tentative/undecided"
+      · cautionary — "avoid / known footgun / works-but-with-caveats"
+      · negative — "rejected, disliked, deprecated"
     """
-    return tools.do_remember(client(), text)
+    return tools.do_remember(client(), text, polarity)
 
 
 @mcp.tool()

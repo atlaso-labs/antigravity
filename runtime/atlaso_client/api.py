@@ -108,17 +108,29 @@ class BrainAPI:
         _raise(r)
         return r.json()
 
-    def deposit_batch(self, items: list[dict[str, Any]]) -> dict[str, Any]:
-        r = self._client.post("/v1/memories/batch", json={"items": items}, timeout=_SYNC_TIMEOUT)
+    def deposit_batch(self, items: list[dict[str, Any]],
+                      capture_stats: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Push a batch of outbox items. `capture_stats` (optional) rides along as a
+        content-free top-level field: the last ≤35 days of cumulative capture
+        counters ([{day, attempts, accepted, drops}]). Additive + backward-compatible
+        — a server that ignores the field must not break the client, and it is only
+        included in the body when present so the wire shape is unchanged without it.
+        The server max-merges the counters, so re-sending is idempotent."""
+        body: dict[str, Any] = {"items": items}
+        if capture_stats is not None:
+            body["capture_stats"] = capture_stats
+        r = self._client.post("/v1/memories/batch", json=body, timeout=_SYNC_TIMEOUT)
         _raise(r)
         return r.json()
 
-    def sync(self, since: int, tomb_since: int = 0, limit: int = 500) -> dict[str, Any]:
-        r = self._client.get(
-            "/v1/memories/sync",
-            params={"since": since, "tomb_since": tomb_since, "limit": limit},
-            timeout=_SYNC_TIMEOUT,
-        )
+    def sync(self, since: int, tomb_since: int = 0, limit: int = 500,
+             changes_cursor: int | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"since": since, "tomb_since": tomb_since, "limit": limit}
+        if changes_cursor is not None:
+            # Opt-in change stream: the server re-sends the full current state of
+            # memories UPDATED in place (polarity/tags/evidence) since this cursor.
+            params["changes_cursor"] = changes_cursor
+        r = self._client.get("/v1/memories/sync", params=params, timeout=_SYNC_TIMEOUT)
         _raise(r)
         return r.json()
 

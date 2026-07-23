@@ -68,12 +68,31 @@ CREATE TABLE IF NOT EXISTS quarantine (
     reason         TEXT NOT NULL,
     quarantined_at TEXT NOT NULL
 );
+
+-- Content-free daily "capture quality" telemetry (LabDirector ruling 2913669f:
+-- counts only — NO content, NO content-derived hashes). Lets the dashboard show
+-- "eligible exchanges captured = server-accepted deposits / eligible capture
+-- opportunities". attempts = gate-PASSED user exchanges (the denominator);
+-- accepted = deposits the server confirmed; drops_json = hygiene-dropped gate
+-- reasons counted separately by reason. All per-UTC-day, monotonic integers.
+CREATE TABLE IF NOT EXISTS capture_stats (
+    day        TEXT PRIMARY KEY,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    accepted   INTEGER NOT NULL DEFAULT 0,
+    drops_json TEXT NOT NULL DEFAULT '{}',
+    -- per-day {hour -> attempts} spread map (content-free ints). Kept LOCAL: the
+    -- payload derives only two ints from it (hours_active, max_hour_attempts) so a
+    -- burst-replay looks different from genuine all-day usage without shipping the
+    -- map itself.
+    hours_json TEXT NOT NULL DEFAULT '{}'
+);
 """
 
 # Additive column migrations for caches created by older clients. Applied
 # opportunistically at open; "duplicate column" errors mean already-migrated.
 _MIGRATIONS = (
     "ALTER TABLE outbox ADD COLUMN edge_blocks INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE capture_stats ADD COLUMN hours_json TEXT NOT NULL DEFAULT '{}'",
 )
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
@@ -91,6 +110,26 @@ def _fts_query(text: str) -> str:
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _utc_day() -> str:
+    """Today's UTC calendar day ('YYYY-MM-DD') — the bucket key for capture stats."""
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _day_of_iso(created_at: str | None) -> str:
+    """The UTC day of a cache timestamp ('%Y-%m-%dT%H:%M:%SZ'); today when the
+    value is missing or malformed. Used to attribute an accepted deposit back to
+    the day its item was originally captured."""
+    if created_at and len(created_at) >= 10 and re.match(r"\d{4}-\d{2}-\d{2}$", created_at[:10]):
+        return created_at[:10]
+    return _utc_day()
+
+
+# Gate reasons that count as an eligible capture OPPORTUNITY (the `attempts`
+# denominator). Every other should_deposit() reason is a hygiene drop, bucketed
+# by reason in drops_json instead.
+_ATTEMPT_REASONS = ("signal", "substantive")
 
 
 class Cache:
@@ -140,6 +179,21 @@ class Cache:
     def set_tomb_cursor(self, seq: int) -> None:
         self._conn.execute(
             "INSERT INTO cache_meta(k, v) VALUES('last_tomb_seq', ?) "
+            "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            (str(int(seq)),),
+        )
+        self._conn.commit()
+
+    def get_changes_cursor(self) -> int:
+        """Cursor into the server's change stream (in-place UPDATEs — polarity
+        reclassification, retraction tags, evidence grade). Distinct from the
+        deposit cursor: deposits page by rowid, changes by change-event seq."""
+        r = self._conn.execute("SELECT v FROM cache_meta WHERE k = 'last_changes_seq'").fetchone()
+        return int(r["v"]) if r else 0
+
+    def set_changes_cursor(self, seq: int) -> None:
+        self._conn.execute(
+            "INSERT INTO cache_meta(k, v) VALUES('last_changes_seq', ?) "
             "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
             (str(int(seq)),),
         )
@@ -386,3 +440,129 @@ class Cache:
         quarantined = self._conn.execute("SELECT count(*) AS n FROM quarantine").fetchone()["n"]
         return {"cached": int(total), "pending": int(pending),
                 "quarantined": int(quarantined), "cursor": self.get_cursor()}
+
+    # ── capture-quality telemetry (content-free daily counters) ───────────────
+    def _apply_drop(self, day: str, reason: str, n: int) -> None:
+        """Read-modify-write a per-day drop bucket (no commit — caller commits)."""
+        row = self._conn.execute(
+            "SELECT drops_json FROM capture_stats WHERE day = ?", (day,)).fetchone()
+        try:
+            drops = json.loads(row["drops_json"]) if row else {}
+        except (ValueError, TypeError):
+            drops = {}
+        drops[reason] = int(drops.get(reason, 0)) + int(n)
+        self._conn.execute(
+            "UPDATE capture_stats SET drops_json = ? WHERE day = ?",
+            (json.dumps(drops, sort_keys=True), day))
+
+    def _bump_hour(self, day: str, hour: int | None) -> None:
+        """Count one attempt into its UTC hour bucket (no commit). Used only to
+        derive the two spread ints; the map never leaves the client."""
+        hr = str(int(hour) if hour is not None else int(time.strftime("%H", time.gmtime())))
+        row = self._conn.execute(
+            "SELECT hours_json FROM capture_stats WHERE day = ?", (day,)).fetchone()
+        try:
+            hours = json.loads(row["hours_json"]) if row and row["hours_json"] else {}
+        except (ValueError, TypeError):
+            hours = {}
+        hours[hr] = int(hours.get(hr, 0)) + 1
+        self._conn.execute(
+            "UPDATE capture_stats SET hours_json = ? WHERE day = ?",
+            (json.dumps(hours, sort_keys=True), day))
+
+    def record_capture_gate(self, reason: str, *, day: str | None = None,
+                            hour: int | None = None) -> None:
+        """Count one capture-gate evaluation for the given UTC day. A gate-PASSED
+        reason (signal/substantive) increments `attempts` — the eligible-opportunity
+        denominator — and its UTC hour bucket (spread signal); every other
+        (hygiene-drop) reason increments its own bucket in drops_json. Content-free
+        by construction: the ONLY things recorded are a fixed reason label and
+        integer counts — never user text, never a content-derived value. Monotonic."""
+        day = day or _utc_day()
+        self._conn.execute(
+            "INSERT INTO capture_stats(day) VALUES(?) ON CONFLICT(day) DO NOTHING", (day,))
+        if reason in _ATTEMPT_REASONS:
+            self._conn.execute(
+                "UPDATE capture_stats SET attempts = attempts + 1 WHERE day = ?", (day,))
+            self._bump_hour(day, hour)
+        else:
+            self._apply_drop(day, reason, 1)
+        self._conn.commit()
+
+    def add_capture_accepted(self, day: str, n: int = 1) -> None:
+        """Add `n` server-accepted (status=="added") deposits to the given UTC day's
+        counter. Content-free integer; monotonic."""
+        if n <= 0:
+            return
+        self._conn.execute(
+            "INSERT INTO capture_stats(day, accepted) VALUES(?, ?) "
+            "ON CONFLICT(day) DO UPDATE SET accepted = accepted + excluded.accepted",
+            (day, int(n)))
+        self._conn.commit()
+
+    def add_capture_accepted_for(self, created_at: str | None, n: int = 1) -> None:
+        """Attribute `n` accepted deposits to the UTC day of `created_at` (the
+        item's ORIGINAL capture day), or today when it's missing/malformed."""
+        self.add_capture_accepted(_day_of_iso(created_at), n)
+
+    def add_capture_drop(self, day: str, reason: str, n: int = 1) -> None:
+        """Add `n` to a per-day drop bucket (e.g. server-deduped "duplicate")."""
+        if n <= 0:
+            return
+        self._conn.execute(
+            "INSERT INTO capture_stats(day) VALUES(?) ON CONFLICT(day) DO NOTHING", (day,))
+        self._apply_drop(day, reason, n)
+        self._conn.commit()
+
+    def add_capture_drop_for(self, created_at: str | None, reason: str, n: int = 1) -> None:
+        """Attribute a drop to the UTC day of `created_at` (the item's original
+        capture day) — used for server-dedup 'duplicate', which is settled at push
+        time but belongs to the day the item was captured."""
+        self.add_capture_drop(_day_of_iso(created_at), reason, n)
+
+    def capture_stats(self, limit: int = 35) -> list[dict]:
+        """The last ≤`limit` UTC days of cumulative capture counters, OLDEST first.
+        Each row: {day, attempts, accepted, drops, hours_active, max_hour_attempts}.
+        Content-free — safe to attach to a sync payload. Deterministic order.
+
+        INVARIANT enforced AT EMIT: accepted is clamped to attempts, so a snapshot
+        can never claim more accepted deposits than eligible opportunities (a
+        replay-only or manual-remember-only day never reads >100% capture quality).
+        The two spread ints (distinct active UTC hours; busiest-hour attempts) are
+        derived from the local hours map, which itself is never emitted."""
+        rows = self._conn.execute(
+            "SELECT day, attempts, accepted, drops_json, hours_json FROM capture_stats "
+            "ORDER BY day DESC LIMIT ?", (limit,)).fetchall()
+        out = []
+        for r in reversed(rows):  # newest ≤N days, re-sorted ascending for the wire
+            try:
+                drops = json.loads(r["drops_json"])
+            except (ValueError, TypeError):
+                drops = {}
+            try:
+                hours = json.loads(r["hours_json"]) if r["hours_json"] else {}
+            except (ValueError, TypeError):
+                hours = {}
+            attempts = int(r["attempts"])
+            hour_counts = [int(v) for v in hours.values()]
+            out.append({
+                "day": r["day"], "attempts": attempts,
+                "accepted": min(int(r["accepted"]), attempts),  # invariant: ≤ attempts
+                "drops": {k: int(v) for k, v in drops.items()},
+                "hours_active": len(hour_counts),
+                "max_hour_attempts": max(hour_counts) if hour_counts else 0,
+            })
+        return out
+
+    def get_capture_stats_hash(self) -> str:
+        """Hash of the counters as of the last successful send (empty string until
+        a first send). Lets an outbox-empty flush skip when nothing changed."""
+        r = self._conn.execute(
+            "SELECT v FROM cache_meta WHERE k = 'capture_stats_hash'").fetchone()
+        return r["v"] if r else ""
+
+    def set_capture_stats_hash(self, h: str) -> None:
+        self._conn.execute(
+            "INSERT INTO cache_meta(k, v) VALUES('capture_stats_hash', ?) "
+            "ON CONFLICT(k) DO UPDATE SET v = excluded.v", (h,))
+        self._conn.commit()

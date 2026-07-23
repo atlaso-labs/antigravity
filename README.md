@@ -1,4 +1,32 @@
-# Atlaso × Google Antigravity
+# Atlaso — memory for Antigravity
+
+**Automatic long-term memory for Google Antigravity** — recall before each turn
+and capture after, in both the IDE and the `agy` CLI, via one native plugin.
+
+## Install
+
+1. Create a free account at [app.atlaso.ai](https://app.atlaso.ai/sign-in) and
+   follow the connect flow for Antigravity, then:
+
+```
+agy plugin install https://github.com/atlaso-labs/antigravity
+```
+
+**What you get**
+
+- One memory across every AI tool you use — what Antigravity learns, Cursor, Codex, and the rest already know
+- Personal memory that follows you, plus per-project memory keyed to each repo
+- Secrets scrubbed client-side before anything is stored; your memory is never trained on or sold
+- Free for one device and one tool — no credit card ([pricing](https://www.atlaso.ai/pricing))
+
+**Links:** [Why Atlaso for Antigravity](https://www.atlaso.ai/for/antigravity) ·
+[Setup guide](https://docs.atlaso.ai/tools/antigravity) ·
+[What is an AI memory layer?](https://www.atlaso.ai/what-is-an-ai-memory-layer) ·
+[Dashboard](https://app.atlaso.ai/sign-in)
+
+---
+
+## How it's built (for the curious)
 
 The [Atlaso](https://atlaso.ai) memory connector for **Google Antigravity** — the
 IDE, the CLI (`agy`), and Antigravity 2.0 — shipped as a **native Antigravity

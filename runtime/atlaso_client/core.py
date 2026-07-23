@@ -15,6 +15,9 @@ sync_once; the core decides HOW.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import uuid
 from typing import Any, Optional
 
@@ -26,6 +29,8 @@ from .cache import Cache
 # batch at 100; we push at most this many per sync tick.
 _PUSH_BATCH = 100
 _SYNC_PAGE = 500
+# How many days of cumulative capture counters ride along on a push (content-free).
+_STATS_DAYS = 35
 
 
 class Client:
@@ -273,6 +278,12 @@ class Client:
         from . import _capture, _project
         try:
             ok, reason = _capture.should_deposit(user_text)
+            # Content-free capture-quality counter (LabDirector ruling 2913669f:
+            # counts only). Guarded so a telemetry hiccup can never lose a memory.
+            try:
+                self.cache.record_capture_gate(reason)
+            except Exception:
+                pass
             if not ok:
                 return {"saved": False, "reason": reason}
             content = _capture.scrub(user_text)[0]
@@ -298,7 +309,17 @@ class Client:
                         return {"saved": False, "reason": "near_dup"}
             except Exception:
                 pass
-            cid = self.remember(content, polarity="open", tags=tags, push=push)
+            # Capture polarity (Week-1 Step 4): default "open" (legacy). With
+            # ATLASO_CAPTURE_PENDING=1, auto-captures land as "pending" — the
+            # honest "not yet classified" state the async classifier drains.
+            # SEQUENCING: the flag stays OFF until the Step-5 classifier is
+            # live in prod. pol-hint:* provenance tags are kept either way.
+            capture_polarity = (
+                "pending"
+                if os.environ.get("ATLASO_CAPTURE_PENDING") == "1"
+                else "open"
+            )
+            cid = self.remember(content, polarity=capture_polarity, tags=tags, push=push)
             return {"saved": True, "id": cid, "scope": scope, "project": proj}
         except Exception:
             return {"saved": False, "reason": "error"}
@@ -473,9 +494,12 @@ class Client:
             p["text"] = it["text"]
         return p
 
-    def _apply_results(self, resp: dict, mapping: dict) -> None:
+    def _apply_results(self, resp: dict, mapping: dict, created: dict | None = None) -> None:
         """Settle server per-item results into the outbox/cache (shared by the
-        batch path and the per-item fallback path)."""
+        batch path and the per-item fallback path). `created` maps client_id →
+        the item's original created_at, used to attribute an accepted deposit back
+        to the day it was captured. Each outbox item settles here exactly once
+        (resolve_outbox removes the row), so accepted is counted exactly once."""
         for res in resp.get("results", []):
             cid = res.get("client_id")
             if not cid:
@@ -488,6 +512,18 @@ class Client:
                 self.cache.resolve_outbox(cid, server_id=sid, content=res.get("text"))
                 if sid:
                     mapping[cid] = sid
+                # content-free counters, attributed to the item's capture day.
+                # ONLY status=="added" is capture quality: a server-deduped
+                # "duplicate" is the SAME memory arriving again (a 93x replay must
+                # read ~0% captured, not 100%), so it lands in its own drop bucket
+                # and never inflates accepted.
+                try:
+                    if status == "added":
+                        self.cache.add_capture_accepted_for((created or {}).get(cid), 1)
+                    else:
+                        self.cache.add_capture_drop_for((created or {}).get(cid), "duplicate", 1)
+                except Exception:
+                    pass
             elif status in ("rejected", "invalid"):
                 # the server's gate refused it — drop the optimistic local row
                 self.cache.resolve_outbox(cid, dropped=True)
@@ -502,32 +538,85 @@ class Client:
     # if the server/network is down, iterating the whole outbox is just noise.
     _TRANSIENT_ABORT_AFTER = 3
 
+    # ── capture-quality stats attachment (content-free) ────────────────────────
+    def _stats_payload(self) -> list[dict] | None:
+        """Current content-free capture counters (last ≤35 days) or None when
+        there are none. Never raises."""
+        try:
+            rows = self.cache.capture_stats(limit=_STATS_DAYS)
+            return rows or None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _stats_hash(rows: list[dict]) -> str:
+        """A hash of the COUNTS themselves (not content) — used only to skip a
+        redundant outbox-empty flush when nothing changed since the last send."""
+        return hashlib.sha256(
+            json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _stats_dirty(self, rows: list[dict] | None) -> bool:
+        """True when there ARE counters and they changed since the last send."""
+        if not rows:
+            return False
+        try:
+            return self._stats_hash(rows) != self.cache.get_capture_stats_hash()
+        except Exception:
+            return False
+
+    def _mark_stats_sent(self, rows: list[dict] | None) -> None:
+        if not rows:
+            return
+        try:
+            self.cache.set_capture_stats_hash(self._stats_hash(rows))
+        except Exception:
+            pass
+
+    def _deposit(self, payloads: list[dict], stats: list[dict] | None) -> dict:
+        """deposit_batch with capture_stats attached only when there's something to
+        send — so the wire shape (and any pre-field API double) is untouched when
+        there are no stats. Attaching stats must never alter item delivery."""
+        if stats is not None:
+            return self.api.deposit_batch(payloads, capture_stats=stats)
+        return self.api.deposit_batch(payloads)
+
     def _push(self) -> dict:
         """Drain the outbox. Fast path: one batch deposit. If the BATCH request
         itself fails for a non-auth reason (edge/WAF block, 5xx, timeout), fall
         back to item-by-item delivery so one poisoned item can't hold the rest
         hostage — the exact failure mode of the Cloudflare incident. Verified app
         auth verdicts (AuthRejected/NotEntitled) propagate to the caller.
+
+        Content-free capture counters ride along on the batch (idempotent — the
+        server max-merges). When the outbox is empty but the counters changed since
+        the last send, a stats-only batch (items=[]) still goes out; when nothing
+        changed and there's nothing to push, this is a no-op. Stats attachment can
+        never wedge delivery: if the batch fails, the per-item fallback runs WITHOUT
+        stats and the counters simply retry next tick.
         Returns {client_id: server_id} for every settled item."""
         items = self.cache.list_outbox(limit=_PUSH_BATCH)
-        if not items:
+        stats = self._stats_payload()
+        if not items and not self._stats_dirty(stats):
             return {}
         mapping: dict[str, str] = {}
+        created = {it["client_id"]: it["created_at"] for it in items}
         try:
-            resp = self.api.deposit_batch([self._item_payload(it) for it in items])
+            resp = self._deposit([self._item_payload(it) for it in items], stats)
         except (AuthRejected, NotEntitled):
             raise  # a verified app verdict — no point retrying per-item
         except Exception as e:
             _telemetry.log("push", "batch_failed", error=type(e).__name__,
                            status=getattr(e, "status", None),
                            cf_ray=getattr(e, "cf_ray", None), items=len(items))
-            self._push_each(items, mapping)
+            self._push_each(items, mapping, created)
             return mapping
-        self._apply_results(resp, mapping)
+        self._apply_results(resp, mapping, created)
+        self._mark_stats_sent(stats)
         _telemetry.log("push", "push_ok", items=len(items), settled=len(mapping))
         return mapping
 
-    def _push_each(self, items: list[dict], mapping: dict) -> None:
+    def _push_each(self, items: list[dict], mapping: dict, created: dict | None = None) -> None:
         """Item-by-item fallback after a failed batch. Delivery semantics:
           • verified app auth verdict → stop (state transition upstream)
           • edge/WAF block → count it; retry once as base64; still blocked at the
@@ -550,7 +639,7 @@ class Client:
                 # 429, or 5xx/timeout on the retry is NOT another edge block and
                 # must never push the item toward quarantine.
                 try:
-                    if self._retry_b64(it, mapping):
+                    if self._retry_b64(it, mapping, created):
                         continue
                 except (AuthRejected, NotEntitled) as e2:
                     self._note_auth_failure(e2)
@@ -588,9 +677,9 @@ class Client:
                     return  # server/network likely down — stop hammering
                 continue
             transient_streak = 0
-            self._apply_results(resp, mapping)
+            self._apply_results(resp, mapping, created)
 
-    def _retry_b64(self, it: dict, mapping: dict) -> bool:
+    def _retry_b64(self, it: dict, mapping: dict, created: dict | None = None) -> bool:
         """One base64 retry for an edge-blocked item (denies the WAF its lexical
         match without changing content). True if the item settled. Exceptions
         PROPAGATE — the caller classifies them (auth vs 429 vs transient vs
@@ -598,7 +687,7 @@ class Client:
         block and quarantined a good memory."""
         resp = self.api.deposit_batch([self._item_payload(it, b64=True)])
         before = len(mapping)
-        self._apply_results(resp, mapping)
+        self._apply_results(resp, mapping, created)
         settled = len(mapping) > before or not any(
             o["client_id"] == it["client_id"] for o in self.cache.list_outbox(limit=_PUSH_BATCH))
         if settled:
@@ -610,7 +699,9 @@ class Client:
         for _ in range(1000):  # hard ceiling: never loop forever
             since = self.cache.get_cursor()
             tomb_since = self.cache.get_tomb_cursor()
-            res = self.api.sync(since, tomb_since=tomb_since, limit=_SYNC_PAGE)
+            ch_since = self.cache.get_changes_cursor()
+            res = self.api.sync(since, tomb_since=tomb_since, limit=_SYNC_PAGE,
+                                changes_cursor=ch_since)
             deposits = res.get("deposits", [])
             for d in deposits:
                 self.cache.upsert_deposit(
@@ -619,13 +710,26 @@ class Client:
                     scope_note=d.get("scope_note"), created_at=d.get("created_at"),
                     tags=d.get("tags") or [], retracted=bool(d.get("retracted")),
                 )
-            # apply forgets from other devices — prune them from the local cache/FTS
+            # change stream: full current state of memories UPDATED in place on the
+            # server (polarity reclassification, retraction tags, evidence grade)
+            # since our changes cursor — the same idempotent upsert applies them.
+            for d in res.get("changes", []):
+                self.cache.upsert_deposit(
+                    id=d["id"], seq=d.get("seq"), content=d.get("content", ""),
+                    polarity=d.get("polarity"), evidence_grade=d.get("evidence_grade"),
+                    scope_note=d.get("scope_note"), created_at=d.get("created_at"),
+                    tags=d.get("tags") or [], retracted=bool(d.get("retracted")),
+                )
+            # apply forgets from other devices — prune them from the local cache/FTS.
+            # Deliberately LAST within a page: if the same id appears in deposits/
+            # changes and tombstones, the deletion must win (never resurrect).
             for t in res.get("tombstones", []):
                 if t.get("id"):
                     self.cache.remove(t["id"])
             pulled += len(deposits)
             next_cursor = int(res.get("next_cursor", since))
             next_tomb = int(res.get("next_tomb_cursor", tomb_since))
+            next_ch = int(res.get("changes_cursor", ch_since))
             advanced = False
             if next_cursor > since:
                 self.cache.set_cursor(next_cursor)
@@ -633,8 +737,12 @@ class Client:
             if next_tomb > tomb_since:
                 self.cache.set_tomb_cursor(next_tomb)
                 advanced = True
-            more = res.get("has_more") or res.get("has_more_tomb")
-            # stop when both drained, or if neither cursor advanced (loop guard)
+            if next_ch > ch_since:
+                self.cache.set_changes_cursor(next_ch)
+                advanced = True
+            more = (res.get("has_more") or res.get("has_more_tomb")
+                    or res.get("has_more_changes"))
+            # stop when all drained, or if no cursor advanced (loop guard)
             if not more or not advanced:
                 break
         return pulled

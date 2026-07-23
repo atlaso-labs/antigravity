@@ -13,6 +13,21 @@ from __future__ import annotations
 
 from typing import Any
 
+# The polarities a MODEL may assign on remember (Week-1 Step 4). 'pending'
+# ("captured, not yet classified") is deliberately excluded — it belongs to
+# the auto-capture pipeline, never to a deliberate remember.
+REMEMBER_POLARITIES = ("positive", "negative", "cautionary", "open")
+
+# The lab's polarity guide — surfaced VERBATIM in the tool description so the
+# model picks the right bucket (see server.py + server/mcp_app.py wrappers).
+POLARITY_GUIDE = (
+    "polarity (required) — which bucket this memory belongs to:\n"
+    '  · positive — "an affirmed preference, adopted tool, active decision, or standing fact"\n'
+    '  · open — "genuinely tentative/undecided"\n'
+    '  · cautionary — "avoid / known footgun / works-but-with-caveats"\n'
+    '  · negative — "rejected, disliked, deprecated"'
+)
+
 
 def do_recall(client, query: str, limit: int = 5) -> dict[str, Any]:
     res = client.recall(query, limit=limit)
@@ -27,10 +42,19 @@ def do_recall(client, query: str, limit: int = 5) -> dict[str, Any]:
     }
 
 
-def do_remember(client, text: str) -> dict[str, Any]:
+def do_remember(client, text: str, polarity: str) -> dict[str, Any]:
     text = (text or "").strip()
     if not text:
         return {"saved": False, "error": "empty text"}
+    # polarity is REQUIRED (Week-1 Step 4): the model calling remember is the
+    # only party that saw the conversation, so it must pick the bucket. The
+    # FastMCP wrapper enforces the enum at schema level; this re-check keeps
+    # the logic safe for direct callers/fakes.
+    if polarity not in REMEMBER_POLARITIES:
+        return {
+            "saved": False,
+            "error": f"polarity must be one of {list(REMEMBER_POLARITIES)}, got {polarity!r}",
+        }
     # `manual` = explicit user remember → UNTOUCHABLE by L2 enrichment (the
     # server enricher's manual guard keys on this tag). Also tag the canonical
     # tool id for attribution when the client knows it.
@@ -38,7 +62,7 @@ def do_remember(client, text: str) -> dict[str, Any]:
     tool = getattr(client, "tool", None)
     if tool:
         tags.insert(0, str(tool))
-    cid = client.remember(text, tags=tags)
+    cid = client.remember(text, polarity=polarity, tags=tags)
     return {"saved": True, "id": cid}
 
 
