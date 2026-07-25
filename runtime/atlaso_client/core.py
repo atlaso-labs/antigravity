@@ -25,6 +25,11 @@ from . import _credential, _telemetry, config, state
 from .api import AuthRejected, BrainAPI, EdgeBlocked, NotEntitled
 from .cache import Cache
 
+# Sentinel for capture(project=…): distinguishes "caller didn't say — derive
+# from the environment" (default) from an explicit None = "this session has NO
+# project" (must stay personal, never cwd-derived).
+_PROJECT_UNSET: Any = object()
+
 # Safety valve: never let a connector's per-turn call balloon. The server caps
 # batch at 100; we push at most this many per sync tick.
 _PUSH_BATCH = 100
@@ -269,7 +274,8 @@ class Client:
 
     def capture(self, user_text: str, assistant_text: str | None = None,
                 *, source_tag: str | None = None, push: bool = False,
-                project: str | None = None) -> dict:
+                project: "str | None | object" = _PROJECT_UNSET,
+                project_dir: str | None = None) -> dict:
         """Commodity capture pipeline (no engine/IP): worth-keeping gate → secret
         scrub → scope route (personal vs project) → polarity hint → near-dup check
         vs the local cache → remember() with the right tags. Preserves the engine
@@ -295,11 +301,35 @@ class Client:
             pol = _capture.heuristic_polarity(user_text)
             tags = [source_tag or self.tool or "atlaso", "auto",
                     f"pol-hint:{pol}", f"scope:{scope}"]
-            # Caller may supply the project key — connectors whose hook cwd is NOT
-            # the repo (e.g. Antigravity, cwd = the plugin dir) pass it from the
-            # event's workspace path; else derive it from the cwd. Only attached for
-            # project-scoped captures.
-            proj = (project if project is not None else _project.project_key()) if scope == "project" else None
+            # Project attribution (tri-state — lab ruling, deposit 52c7e97d):
+            #   • caller passed a key            → use it ('ok')
+            #   • caller passed project=None     → "this session HAS no project"
+            #     (e.g. empty Antigravity workspace) → genuine personal scope;
+            #     the sentinel keeps this apart from "didn't say" (the old
+            #     `is not None` check turned every honest None into a junk
+            #     cwd-derived key)
+            #   • otherwise derive from project_dir (the hook event's cwd) /
+            #     ATLASO_CALLER_PWD / process cwd — 'ok' tags the key; 'none'
+            #     (root is $HOME etc.) downgrades to personal; 'unknown' (the
+            #     measurement was garbage: plugin/cache dir, error) records an
+            #     unattributed project memory with a provenance marker so it is
+            #     never silently buried and the failure rate stays observable.
+            proj: str | None = None
+            if scope == "project":
+                if project is _PROJECT_UNSET:
+                    from pathlib import Path as _Path
+                    status, proj = _project.project_resolution(
+                        _Path(project_dir) if project_dir else None)
+                elif project is None:
+                    status = "none"
+                else:
+                    status, proj = "ok", project
+                if status == "none":
+                    scope = "personal"
+                    tags = [t for t in tags if t != "scope:project"]
+                    tags.append("scope:personal")
+                elif status == "unknown":
+                    tags.append("project-unknown")
             if proj:
                 tags.append(f"project:{proj}")
             # near-dup vs the local commodity cache (offline-safe; no server call)
@@ -470,6 +500,14 @@ class Client:
         except Exception as e:
             self._note_auth_failure(e)
             return {"pushed": 0, "pulled": 0}
+        # One-shot junk-project-key rescue (the plugin-cwd bug) — only this
+        # machine can prove which legacy keys are junk. Best-effort; marker
+        # inside makes it a no-op forever after the first success.
+        try:
+            from . import _reconcile
+            _reconcile.run_if_due(self)
+        except Exception:
+            pass
         # refresh the cached ambient block off the hot path (best-effort) so the
         # next SessionStart can emit it instantly.
         try:

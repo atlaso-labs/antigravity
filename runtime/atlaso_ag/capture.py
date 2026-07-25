@@ -28,11 +28,16 @@ def run(payload: dict, client) -> bool:
     # Route through the shared commodity pipeline (gate / scrub / scope / near-dup).
     # Project comes from the workspace, NOT cwd (cwd is the plugin dir). push=False =
     # instant local write; the flush below syncs it.
-    res = client.capture(
-        user_text, asst_text,
-        source_tag=_shim.TOOL, push=False,
-        project=_shim.workspace_project(payload),
-    )
+    ws = _shim.workspace_dir(payload)
+    if ws:
+        res = client.capture(user_text, asst_text,
+                             source_tag=_shim.TOOL, push=False, project_dir=ws)
+    else:
+        # No workspace = a scratch session: explicitly NO project (personal).
+        # Passing None (not omitting) keeps the client from deriving a key
+        # off the junk plugin-dir cwd.
+        res = client.capture(user_text, asst_text,
+                             source_tag=_shim.TOOL, push=False, project=None)
     return bool(res.get("saved"))
 
 

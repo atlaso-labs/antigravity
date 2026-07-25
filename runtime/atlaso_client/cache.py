@@ -184,6 +184,20 @@ class Cache:
         )
         self._conn.commit()
 
+    def get_meta(self, key: str) -> str | None:
+        """Generic cache_meta read (one-shot markers, e.g. the junk-project
+        reconcile). Cursors above keep their dedicated typed accessors."""
+        r = self._conn.execute("SELECT v FROM cache_meta WHERE k = ?", (key,)).fetchone()
+        return r["v"] if r else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT INTO cache_meta(k, v) VALUES(?, ?) "
+            "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            (key, value),
+        )
+        self._conn.commit()
+
     def get_changes_cursor(self) -> int:
         """Cursor into the server's change stream (in-place UPDATEs — polarity
         reclassification, retraction tags, evidence grade). Distinct from the

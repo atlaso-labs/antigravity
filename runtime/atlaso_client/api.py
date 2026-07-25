@@ -134,6 +134,15 @@ class BrainAPI:
         _raise(r)
         return r.json()
 
+    def reconcile_projects(self, items: list[dict[str, str]]) -> dict[str, Any]:
+        """Submit legacy junk-key claims [{key, path}] this machine can prove it
+        minted from its own plugin-install paths (the plugin-cwd bug). The path
+        is proof material — the server re-derives the hash and re-checks the
+        territory, then retags matching rows to scope:orphaned (reconcile.py)."""
+        r = self._client.post("/v1/memories/reconcile-projects", json={"items": items})
+        _raise(r)
+        return r.json()
+
     def recent(self, limit: int = 20) -> dict[str, Any]:
         r = self._client.get("/v1/memories", params={"limit": limit})
         _raise(r)

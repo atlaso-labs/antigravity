@@ -62,22 +62,29 @@ def maybe_autoconnect() -> bool:
         return False
 
 
-def workspace_project(payload: dict) -> str | None:
-    """Per-project key from the FIRST workspacePaths entry. Antigravity hooks run
-    with cwd = the plugin dir, so cwd-based project detection is wrong here — we must
-    derive the project from the payload's workspace. None → personal-only (and an
-    empty workspace, e.g. a scratch session, is correctly personal-only)."""
+def workspace_dir(payload: dict) -> str | None:
+    """The FIRST workspacePaths entry, or None for a scratch session with no
+    workspace. Antigravity hooks run with cwd = the plugin dir, so cwd-based
+    project detection is wrong here — the payload's workspace is the only
+    trustworthy signal. Callers pass an explicit project=None for the empty
+    case so the client never falls back to the junk cwd."""
     ws = payload.get("workspacePaths") or payload.get("workspace_paths") or []
     if isinstance(ws, str):
         ws = [ws]
-    if not ws:
+    return ws[0] if ws else None
+
+
+def workspace_project(payload: dict) -> str | None:
+    """Per-project recall key from the workspace. None → personal-only."""
+    d = workspace_dir(payload)
+    if not d:
         return None
     try:
         from pathlib import Path
 
         from atlaso_client import _project
 
-        return _project.project_key(Path(ws[0]))
+        return _project.project_key(Path(d))
     except Exception:
         return None
 
