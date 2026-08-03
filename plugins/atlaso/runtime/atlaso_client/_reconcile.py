@@ -114,8 +114,9 @@ def _retag_local(cache, matched_keys: list[str]) -> None:
                 "  (SELECT json_group_array(value) FROM json_each(cached_deposits.tags_json)"
                 "     WHERE value <> 'project:' || ?1 AND value <> 'scope:project'),"
                 "  '$[#]', 'scope:orphaned'), '$[#]', 'project-orphaned:' || ?1) "
-                "WHERE EXISTS (SELECT 1 FROM json_each(cached_deposits.tags_json)"
-                "              WHERE value = 'project:' || ?1)",
+                "WHERE retracted = 0 AND EXISTS ("
+                "  SELECT 1 FROM json_each(cached_deposits.tags_json)"
+                "  WHERE value = 'project:' || ?1)",
                 (key,),
             )
         except Exception:
