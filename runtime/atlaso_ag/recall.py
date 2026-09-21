@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import re
 import sys
 
@@ -80,9 +81,55 @@ def run(payload: dict, client) -> dict | None:
     session = payload.get("conversationId") or payload.get("conversation_id")
     res = client.recall(prompt, limit=limit, project=project, session=session)
     block = render(res.get("results", []))
-    if not block:
+    notice = _degraded_notice(res, client)
+    steps = []
+    if notice:
+        steps.append({"ephemeralMessage": notice})
+    if block:
+        steps.append({"ephemeralMessage": block})
+    if not steps:
         return None
-    return {"injectSteps": [{"ephemeralMessage": block}]}
+    return {"injectSteps": steps}
+
+
+_DEGRADED_TEXT = ("Atlaso · cloud recall isn't responding — memory is running from this device's local cache "
+                  "(results may be shallower). Capture and sync are unaffected; this clears on its own once the service responds.")
+
+
+def _degraded_notice(res: dict, client) -> str | None:
+    """Production audit E6 / C15 (LabDirector 160ff6e9 interventional falsifier): Antigravity had NO surface that told the
+    user when a LINKED device silently fell back to the local keyword floor. Keyed on the EXISTING `source:"local"` field of
+    the recall result plus the client's fallback episode (no emitter changed); shown once per episode via a marker file,
+    clears itself when the episode clears. Never raises; never fires in local-only / not-connected modes (those are the
+    autoconnect flow's concern, not a degradation)."""
+    try:
+        if res.get("source") != "local":
+            return None
+        mode = client.cloud_mode() if hasattr(client, "cloud_mode") else {}
+        if (mode or {}).get("mode") != "linked":
+            return None
+        from atlaso_client import _fallback
+        ep = _fallback.episode()
+        if not ep:
+            return None
+        key = _fallback.episode_key(ep)   # nonce-keyed: same-second reform is a new episode (cc61a3cf)
+        marker = _marker_path(key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            # exclusive create: two concurrent first turns cannot both win (exists()/write_text was a TOCTOU race)
+            with open(marker, "x") as fh:
+                fh.write(str(int(time.time())))
+        except FileExistsError:
+            return None
+        return _DEGRADED_TEXT
+    except Exception:
+        return None
+
+
+def _marker_path(key: str):
+    from pathlib import Path
+    base = os.environ.get("ATLASO_GLOBAL_PATH") or os.path.join(os.path.expanduser("~"), ".atlaso")
+    return Path(base) / "notice_shown" / ("ag_" + key.replace(":", "_"))
 
 
 def main() -> int:

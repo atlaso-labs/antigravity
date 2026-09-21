@@ -16,7 +16,7 @@ from mcp.server.fastmcp import FastMCP
 
 from atlaso_client import Client
 
-from . import tools
+from . import attest, tools
 
 # Server instructions (≤2KB): tell the model WHEN to reach for these tools vs the
 # automatic recall hook. Shown to the model when it considers this server.
@@ -60,6 +60,21 @@ def client() -> Client:
     return _client
 
 
+# ── install attestation: the mcp_tool_call component ──────────────────────────
+#
+# Each tool body ends with `attest.note_tool_call()` — AFTER the real work has
+# already produced a return value, and never anywhere else. That placement is the
+# component's entire meaning: `mcp_tool_call` claims "an Atlaso MCP tool was
+# invoked and returned", and only a line that runs at the tail of a tool body can
+# honestly claim it. Emitted in `main()` instead, it would attest that the host
+# started a process — which is true of every partial install where negotiation
+# fails or the model never calls a tool.
+#
+# It is repeated per tool rather than hidden in a decorator on purpose: FastMCP
+# derives each tool's JSON schema from the live signature, and a wrapper is one
+# refactor away from either breaking that or silently moving the proof earlier.
+# Five explicit lines cannot drift. See attest.py for why it is free.
+
 @mcp.tool()
 def recall(query: str, limit: int = 5) -> dict:
     """Search the user's Atlaso memory for notes relevant to `query`.
@@ -67,7 +82,9 @@ def recall(query: str, limit: int = 5) -> dict:
     Call this to look up relevant memory before answering — past decisions,
     preferences, project facts. Returns a ranked list of {id, content}. Read-only.
     """
-    return tools.do_recall(client(), query, limit)
+    out = tools.do_recall(client(), query, limit)
+    attest.note_tool_call()
+    return out
 
 
 @mcp.tool()
@@ -86,7 +103,9 @@ def remember(
       · cautionary — "avoid / known footgun / works-but-with-caveats"
       · negative — "rejected, disliked, deprecated"
     """
-    return tools.do_remember(client(), text, polarity)
+    out = tools.do_remember(client(), text, polarity)
+    attest.note_tool_call()
+    return out
 
 
 @mcp.tool()
@@ -95,20 +114,26 @@ def forget(id: str) -> dict:
 
     Destructive and not undoable — use only when the user asks to forget something.
     """
-    return tools.do_forget(client(), id)
+    out = tools.do_forget(client(), id)
+    attest.note_tool_call()
+    return out
 
 
 @mcp.tool()
 def recent(limit: int = 10) -> dict:
     """List the most recent memories (newest first). Read-only."""
-    return tools.do_recent(client(), limit)
+    out = tools.do_recent(client(), limit)
+    attest.note_tool_call()
+    return out
 
 
 @mcp.tool()
 def status() -> dict:
     """Memory status: connected?, how many stored/pending, and the health score
     (FMI). Read-only."""
-    return tools.do_status(client())
+    out = tools.do_status(client())
+    attest.note_tool_call()
+    return out
 
 
 def main() -> None:

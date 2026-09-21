@@ -43,7 +43,22 @@ def _garbage_root(root: Path) -> bool:
     Distinct from _no_project_root: garbage → status 'unknown'."""
     try:
         parts = set(root.parts)
-        if parts & _TOOL_DOT_DIRS:
+        blocked = parts & _TOOL_DOT_DIRS
+        # A managed worktree and its nested packages are real project territory.
+        # Every dot-tool ancestor must be a proven worktree, so a plugin cache
+        # nested inside a worktree never inherits this exception.
+        for name in (".claude", ".codex"):
+            seq = root.parts
+            positions = [i for i, part in enumerate(seq) if part == name]
+            if positions and all(
+                seq[i + 1:i + 2] == ("worktrees",)
+                and any((ancestor / ".git").exists()
+                        for ancestor in (root, *root.parents)
+                        if len(ancestor.parts) > i + 2)
+                for i in positions
+            ):
+                blocked.discard(name)
+        if blocked:
             return True
         # plugin caches that hide under non-dot dirs (marketplaces/cache/repos
         # layouts, e.g. "…/plugins/marketplaces/atlaso/atlaso/runtime")
@@ -66,7 +81,7 @@ def _no_project_root(root: Path) -> bool:
     itself, the filesystem root). A trustworthy 'no project here' answer —
     status 'none', genuine personal scope."""
     try:
-        return root == Path.home() or root == Path(root.anchor)
+        return root == Path.home().resolve() or root == Path(root.anchor)
     except OSError:
         return True
 
@@ -79,12 +94,9 @@ def _start_dir(start: Optional[Path]) -> Optional[Path]:
         return start
     env = os.environ.get("ATLASO_CALLER_PWD")
     if env:
-        p = Path(env)
-        try:
-            if p.is_dir():
-                return p
-        except OSError:
-            pass
+        # Preserve a bad explicit measurement so resolution returns unknown;
+        # falling back to the runtime cwd can invent a different project.
+        return Path(env)
     return None  # → project_root falls back to Path.cwd()
 
 
@@ -95,11 +107,15 @@ def project_root(start: Optional[Path] = None) -> Path:
         return Path.cwd()
     for d in (cur, *cur.parents):
         try:
+            # Preserve the established nearest-marker identity for opened
+            # packages. A home dotfiles repo must not absorb projects below it.
+            if _no_project_root(d):
+                return cur
             if any((d / m).exists() for m in _MARKERS):
                 return d
         except OSError:
             continue
-    return cur  # no markers → the cwd itself is the "project"
+    return cur
 
 
 def _git_origin(root: Path) -> Optional[str]:
@@ -233,6 +249,11 @@ def project_resolution(start: Optional[Path] = None) -> tuple[str, Optional[str]
     298 memories became indistinguishable from "no project" and disappeared
     (lab ruling; field deposit 52c7e97d)."""
     try:
+        explicit = _start_dir(start)
+        if explicit is not None and (not explicit.is_absolute() or not explicit.is_dir()):
+            return "unknown", None
+        if _garbage_root((explicit or Path.cwd()).resolve()):
+            return "unknown", None
         root = project_root(start)
         if _garbage_root(root):
             return "unknown", None
@@ -241,9 +262,11 @@ def project_resolution(start: Optional[Path] = None) -> tuple[str, Optional[str]
         origin = _git_origin(root)
         if origin:
             key = _normalize_remote(origin)
-            if key:
-                return "ok", key[:120]
-        return "ok", _fallback_key(root)
+            if valid_key(key):
+                return "ok", key
+            return "unknown", None
+        key = _fallback_key(root)
+        return ("ok", key) if valid_key(key) else ("unknown", None)
     except Exception:
         return "unknown", None
 
@@ -253,3 +276,10 @@ def project_key(start: Optional[Path] = None) -> Optional[str]:
     the 'none' and 'unknown' cases — recall treats them the same)."""
     status, key = project_resolution(start)
     return key if status == "ok" else None
+
+
+def valid_key(key) -> bool:
+    """Ambient keys are exact identities, never truncated or coerced."""
+    return (isinstance(key, str) and 0 < len(key) <= 512
+            and key == key.strip() and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in key)
+            and key not in {"unknown", "project-unknown"})

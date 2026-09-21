@@ -66,7 +66,8 @@ class Client:
         self.tool = tool
         # This machine's device_id (from auth.json). With `tool`, it scopes the
         # cached cloud-link verdict so a different tool/device never inherits it.
-        self._device_id = (config.load_auth() or {}).get("device_id")
+        self._ambient_auth = config.load_auth() or {}
+        self._device_id = self._ambient_auth.get("device_id")
         # Which credential file backed this session's token ("own" = this tool's, so a
         # 401 retires only IT; "shared" = the legacy bearer, which we must never delete
         # out from under the machine's other integrations).
@@ -322,8 +323,10 @@ class Client:
                         _Path(project_dir) if project_dir else None)
                 elif project is None:
                     status = "none"
-                else:
+                elif _project.valid_key(project):
                     status, proj = "ok", project
+                else:
+                    status, proj = "unknown", None
                 if status == "none":
                     scope = "personal"
                     tags = [t for t in tags if t != "scope:project"]
@@ -335,7 +338,10 @@ class Client:
             # near-dup vs the local commodity cache (offline-safe; no server call)
             try:
                 for e in self.cache.keyword_search(content[:200], 5):
-                    if _capture.near_dup(content, (e or {}).get("content", "")):
+                    if (_project.scope_of((e or {}).get("tags")) == (scope, proj)
+                            and ("project-unknown" in ((e or {}).get("tags") or []))
+                            == ("project-unknown" in tags)
+                            and _capture.near_dup(content, (e or {}).get("content", ""))):
                         return {"saved": False, "reason": "near_dup"}
             except Exception:
                 pass
@@ -364,11 +370,25 @@ class Client:
         Always returns {source, results, is_confident, has_disagreement}. Never raises."""
         if self._online():
             try:
-                res = self.api.recall(query, limit, project=project, session=session)
+                from . import _retrieval_echo
+                res = self.api.recall(query, limit, project=project, session=session,
+                                      surface="hook_recall",
+                                      prev_event=_retrieval_echo.take_pending())
                 res["source"] = "server"
+                # retrieval_event echo: remember this event id so the NEXT
+                # recall can settle block_emitted server-side (spec 3440342a §c).
+                # The hook renders every returned result, so emitted == bool(results).
+                _retrieval_echo.store(res.pop("_retrieval_event_id", None),
+                                      bool(res.get("results")))
+                from . import _fallback
+                _fallback.record_server_ok()
                 return res
             except Exception as e:
                 self._note_auth_failure(e)  # fall through to the local floor
+                # Degradation is otherwise invisible (fail-open): count it so
+                # the SessionStart notice can surface a persistent episode.
+                from . import _fallback
+                _fallback.record_fallback()
         try:
             # over-fetch then apply the SAME per-project visibility rule as the
             # server, so OFFLINE recall can't leak repo A's project memory into
@@ -424,82 +444,123 @@ class Client:
             return None
 
     def _ambient_identity(self) -> str | None:
-        """Bind the cached block to server + account + device + tool (Codex MED).
-        None when we lack a user_id/device_id → ineligible to load any ambient."""
+        """Bind snapshots to the credential/account this client was created for.
+
+        A reconnect invalidates even fresh snapshots; a long-lived client must
+        never label the old account's HTTP response with the new account's ID.
+        """
         auth = config.load_auth() or {}
-        server = auth.get("server") or config.DEFAULT_SERVER
-        uid = auth.get("user_id")
-        dev = auth.get("device_id") or self._device_id
-        if not (uid and dev):
+        fields = ("server", "user_id", "device_id", "token")
+        if any(auth.get(k) != self._ambient_auth.get(k) for k in fields):
             return None
-        return f"{server}:{uid}:{dev}:{self.tool}"
+        if not all(auth.get(k) for k in ("user_id", "device_id", "token")):
+            return None
+        material = [auth.get(k) for k in fields] + [self.tool, self._cred_token]
+        return hashlib.sha256(json.dumps(material).encode()).hexdigest()
 
-    def ambient(self) -> str | None:
-        """The Ambient Memory orientation block — the SAME server source for every
-        tool (connectors differ only in HOW they inject the returned string).
-        Hits the network; None when offline / not cloud-linked / not paid / nothing
-        to say. Never raises. For the hot path use ambient_cached()."""
-        if not self._online():
+    @staticmethod
+    def _ambient_project(project, project_dir):
+        from . import _project
+        from pathlib import Path
+        if project is _PROJECT_UNSET:
+            try:
+                status, key = _project.project_resolution(Path(project_dir) if project_dir else None)
+            except (TypeError, ValueError, OSError):
+                return None
+            return key if status == "ok" and _project.valid_key(key) else None
+        return project if _project.valid_key(project) else None
+
+    def ambient(self, *, project=_PROJECT_UNSET, project_dir: str | None = None) -> str | None:
+        """Fetch a fresh, server-authorized scoped brief. Errors emit nothing.
+
+        The ambient endpoint itself checks the plan, tool, reconnect and feature
+        gates. Avoid a separate entitlement call here: it adds latency and can
+        suppress recovery after a reconnect. Old servers that ignore the scope
+        parameters fail the envelope check and cannot leak a global brief.
+        """
+        from . import _ambient
+        key = self._ambient_project(project, project_dir)
+        ident = self._ambient_identity()
+        if not ident or self.api is None or not self.tool:
             return None
         try:
-            res = self.api.ambient()
+            res = self.api.ambient(project=key, tool=self.tool)
+            valid = (isinstance(res, dict) and res.get("scope_version") == 1
+                     and "project" in res and res["project"] == key
+                     and res.get("tool") == self.tool)
+            block = res.get("block") if valid else None
+            block = block if isinstance(block, str) and block.strip() else None
+            if self._ambient_identity() != ident:
+                return None
+            # Definitive denial, disabled setting, and incompatible servers all
+            # erase this snapshot. Network errors never turn into cached delivery.
+            _ambient.save(self.tool, ident, block, project=key)
+            return block
         except Exception as e:
             self._note_auth_failure(e)
             return None
-        block = res.get("block")
-        return block if isinstance(block, str) and block.strip() else None
 
-    def ambient_cached(self) -> str | None:
-        """Hot path: the cached block ONLY (file-only, no network) so SessionStart
-        stays instant. None when nothing fresh is cached.
+    def ambient_start(self, *, project=_PROJECT_UNSET,
+                      project_dir: str | None = None) -> str | None:
+        """Session-start delivery, including the very first session.
 
-        Gated on the persisted cloud-link verdict (Codex HIGH#1): if this identity
-        is LOCAL-ONLY (token revoked / tool not entitled / not connected) we never
-        serve a cached block AND clear it, so a stale paid-era block can't surface
-        after revocation/de-entitlement or resurrect on re-link. The block's own
-        TTL bounds the paid→free downgrade window (Codex HIGH#2); a fresh cached
-        block IS a fresh paid verdict (it's only written when the server confirmed
-        paid)."""
+        Always revalidate online, even if a fresh snapshot exists: disabling the
+        feature or changing plans must affect the next session immediately.
+        Offline/timeout/5xx abstain; reconnect retries on the next session.
+        """
+        return self.ambient(project=project, project_dir=project_dir)
+
+    def ambient_cached(self, *, project=_PROJECT_UNSET,
+                       project_dir: str | None = None) -> str | None:
+        """File-only inspection of a scoped snapshot, never session delivery.
+
+        Supported SessionStart consumers use ambient_start for live gate checks.
+        """
+        from . import _ambient
         ident = self._ambient_identity()
         if not ident:
             return None
-        from . import _ambient
+        key = self._ambient_project(project, project_dir)
         if self.cloud_mode().get("mode") == state.LOCAL_ONLY:
-            _ambient.save(self.tool, ident, None)  # clear — never serve / resurrect
+            _ambient.save(self.tool, ident, None, project=key)
             return None
-        return _ambient.load(self.tool, ident)
+        return _ambient.load(self.tool, ident, project=key)
 
-    def refresh_ambient(self) -> None:
-        """Background: fetch the block and cache it. Only writes on a definitive
-        server answer (paid→block / free→null), so a transient offline never
-        clobbers a good cached block. Best-effort, never raises."""
-        if not self._online():
-            return
-        ident = self._ambient_identity()
-        if not ident:
-            return
-        try:
-            res = self.api.ambient()
-        except Exception as e:
-            self._note_auth_failure(e)
-            return
-        from . import _ambient
-        _ambient.save(self.tool, ident, res.get("block"))
+    def refresh_ambient(self, *, project=_PROJECT_UNSET,
+                        project_dir: str | None = None) -> None:
+        """Best-effort refresh under the same project/tool envelope validation."""
+        self.ambient(project=project, project_dir=project_dir)
 
     # ── sync ─────────────────────────────────────────────────────────────────
     def sync_once(self) -> dict:
-        """Push the outbox, then pull new server deposits. Returns {pushed, pulled}.
-        Safe to call from a SessionEnd hook or a background thread. In LOCAL-ONLY
-        (no token / revoked / non-active tool) this is a no-op for the cloud — the
-        local cache + outbox are left intact so nothing is lost before re-linking."""
+        """Push the outbox, then pull new server deposits.
+
+        Returns {pushed, pulled, synced}. Safe to call from a SessionEnd hook or a
+        background thread. In LOCAL-ONLY (no token / revoked / non-active tool) this
+        is a no-op for the cloud — the local cache + outbox are left intact so
+        nothing is lost before re-linking.
+
+        `synced` IS THE ONLY HONEST SUCCESS SIGNAL HERE, and it exists because this
+        method DOES NOT RAISE ON FAILURE. A transport error is caught, routed to
+        _note_auth_failure, and reported as {"pushed": 0, "pulled": 0} — byte-
+        identical to a healthy sync with an empty outbox. Local-only returns the
+        same dict without touching the network at all. So a caller that treats "it
+        returned" as "it worked" is wrong on both of the paths that matter, and the
+        install canary in the SessionEnd hook is exactly such a caller: hook_capture
+        claims a real authenticated round-trip to the brain completed, which is a
+        claim only this flag can support. True here means precisely that: push and
+        pull both completed against the server. The post-sync best-effort extras
+        (reconcile, ambient refresh) are deliberately NOT part of it — they are
+        local housekeeping and their failure does not un-complete a round-trip.
+        """
         if not self._online():
-            return {"pushed": 0, "pulled": 0}
+            return {"pushed": 0, "pulled": 0, "synced": False}
         try:
             pushed = len(self._push())
             pulled = self._pull()
         except Exception as e:
             self._note_auth_failure(e)
-            return {"pushed": 0, "pulled": 0}
+            return {"pushed": 0, "pulled": 0, "synced": False}
         # One-shot junk-project-key rescue (the plugin-cwd bug) — only this
         # machine can prove which legacy keys are junk. Best-effort; marker
         # inside makes it a no-op forever after the first success.
@@ -508,13 +569,13 @@ class Client:
             _reconcile.run_if_due(self)
         except Exception:
             pass
-        # refresh the cached ambient block off the hot path (best-effort) so the
-        # next SessionStart can emit it instantly.
+        # Refresh the scoped snapshot for inspection (best-effort). SessionStart
+        # still validates current server policy before emitting any brief.
         try:
             self.refresh_ambient()
         except Exception:
             pass
-        return {"pushed": pushed, "pulled": pulled}
+        return {"pushed": pushed, "pulled": pulled, "synced": True}
 
     @staticmethod
     def _item_payload(it: dict, *, b64: bool = False) -> dict:

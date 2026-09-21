@@ -98,15 +98,32 @@ class BrainAPI:
         self.close()
 
     def recall(self, query: str, limit: int = 5, project: str | None = None,
-               session: str | None = None) -> dict[str, Any]:
+               session: str | None = None, *, surface: str | None = None,
+               prev_event: str | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {"q": query, "limit": limit}
         if project:
             params["project"] = project  # per-project scope filter
         if session:
             params["session"] = session  # for server-side recall-usefulness logging
-        r = self._client.get("/v1/recall", params=params)
+        # retrieval_event logger observations (frozen spec 3440342a §c): the
+        # client reports exactly two things — a descriptive surface/version
+        # header, and the PREVIOUS event's block_emitted bit, piggybacked so
+        # there is never an extra round trip. Both are best-effort and the
+        # server validates them against a fixed allow-list; nothing here may
+        # ever carry query text, memory content, paths, or session ids.
+        headers: dict[str, str] = {}
+        if surface:
+            from . import __version__ as _cv
+            headers["X-Atlaso-Recall-Context"] = f"surface={surface};client={_cv}"
+        if prev_event:
+            headers["X-Atlaso-Recall-Prev"] = prev_event
+        r = self._client.get("/v1/recall", params=params, headers=headers or None)
         _raise(r)
-        return r.json()
+        out = r.json()
+        eid = r.headers.get("X-Atlaso-Recall-Event")
+        if eid:
+            out["_retrieval_event_id"] = eid
+        return out
 
     def deposit_batch(self, items: list[dict[str, Any]],
                       capture_stats: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -158,11 +175,14 @@ class BrainAPI:
         _raise(r)
         return r.json()
 
-    def ambient(self) -> dict[str, Any]:
+    def ambient(self, *, project: str | None = None, tool: str | None = None) -> dict[str, Any]:
         """Fetch the Ambient Memory orientation block (the single source every tool
         injects). Paid-only server-side: a 402 means not-paid → {block: None}
         rather than an error the caller must handle."""
-        r = self._client.get("/v1/ambient")
+        params = {"tool": tool} if tool else {}
+        if project is not None:
+            params["project"] = project
+        r = self._client.get("/v1/ambient", params=params, timeout=2.0)
         if r.status_code == 402:
             return {"block": None}
         _raise(r)

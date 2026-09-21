@@ -14,4 +14,4 @@ from .cache import Cache
 from .core import Client
 
 __all__ = ["Client", "Cache"]
-__version__ = "0.1.0"
+__version__ = "0.1.1"
