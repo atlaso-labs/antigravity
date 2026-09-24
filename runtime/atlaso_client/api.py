@@ -188,6 +188,31 @@ class BrainAPI:
         _raise(r)
         return r.json()
 
+    def ambient_result(self, *, project: str | None = None,
+                       tool: str | None = None) -> tuple[int, dict[str, Any] | None, str | None]:
+        """Return the ambient HTTP verdict for MCP without the hook's 402 silence.
+
+        This does not change ambient(), whose null-on-402 contract is used by
+        existing session hooks. Non-JSON failures never masquerade as empty.
+        """
+        params = {"tool": tool} if tool else {}
+        if project is not None:
+            params["project"] = project
+        r = self._client.get(
+            "/v1/ambient", params=params, timeout=2.0,
+            headers={"X-Atlaso-Ambient-Surface": "mcp-ambient"},
+        )
+        status = r.status_code
+        cause = r.headers.get("x-atlaso-error")
+        if status == 200:
+            try:
+                return status, r.json(), cause
+            except ValueError:
+                return status, None, cause
+        if status in (401, 403):
+            _raise(r)
+        return status, None, cause
+
     # ── plan / tool entitlement ────────────────────────────────────────────────
     def entitlement(self) -> dict[str, Any]:
         """This device's tool policy: {device_id, active_tool, multi_tool,

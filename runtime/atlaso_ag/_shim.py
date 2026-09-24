@@ -63,15 +63,22 @@ def maybe_autoconnect() -> bool:
 
 
 def workspace_dir(payload: dict) -> str | None:
-    """The FIRST workspacePaths entry, or None for a scratch session with no
-    workspace. Antigravity hooks run with cwd = the plugin dir, so cwd-based
-    project detection is wrong here — the payload's workspace is the only
-    trustworthy signal. Callers pass an explicit project=None for the empty
-    case so the client never falls back to the junk cwd."""
+    """The workspace that scopes recall and capture, or None for personal scope.
+
+    Order: the FIRST workspacePaths entry; else ATLASO_AG_HOST_CWD, which
+    hooks/_resolve.sh sets to the cwd of the hook's parent only when that parent
+    is agy (it is empty otherwise, and an inherited value is overwritten); else
+    None. The hook's own cwd is never used, because Antigravity runs hooks with
+    cwd = the plugin dir. Callers pass an explicit project=None for the None
+    case so the client does not fall back to that cwd."""
     ws = payload.get("workspacePaths") or payload.get("workspace_paths") or []
     if isinstance(ws, str):
         ws = [ws]
-    return ws[0] if ws else None
+    if ws:
+        return ws[0]
+    # `agy -p` sends workspacePaths [] while the host itself uses its cwd as the
+    # workspace; _resolve.sh records that cwd after checking the parent is agy.
+    return os.environ.get("ATLASO_AG_HOST_CWD") or None
 
 
 def workspace_project(payload: dict) -> str | None:

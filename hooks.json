@@ -1,6 +1,9 @@
 {
   "atlaso": {
     "enabled": true,
+    "SessionStart": [
+      { "type": "command", "command": "./hooks/start.sh", "timeout": 15 }
+    ],
     "PreInvocation": [
       { "type": "command", "command": "./hooks/recall.sh", "timeout": 15 }
     ],

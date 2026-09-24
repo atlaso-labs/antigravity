@@ -18,6 +18,34 @@
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _TOOL_DIR="$(cd "$_HERE/.." && pwd)"
 
+# The host's cwd. `agy -p` sends workspacePaths [] while treating its own cwd as the
+# workspace, and hooks run with cwd = the plugin dir, so read the parent's cwd. agy runs
+# a hook as `/usr/bin/env bash <hook>` and env execs, so $PPID is agy itself. Any other
+# parent (a `sh -c` wrapper, an IDE, a user shell) may sit in an unrelated repo and would
+# tag recall and capture with the wrong project, so its cwd is never used.
+_atlaso_parent_is_agy() {
+  local comm
+  comm="$(ps -o comm= -p "$PPID" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  [ "${comm##*/}" = "agy" ]
+}
+
+_atlaso_host_cwd() {
+  _atlaso_parent_is_agy || return 0
+  if [ -r "/proc/$PPID/cwd" ]; then
+    readlink "/proc/$PPID/cwd" 2>/dev/null
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -a -p "$PPID" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1
+  fi
+}
+
+# Resolved at source time, while agy is certainly alive (capture.sh backgrounds its run).
+# Always recomputed: an inherited ATLASO_AG_HOST_CWD (a stray export in the user's shell
+# or in a parent process) is overwritten, so the value the hook modules read comes from
+# this resolver, in this process tree, for a verified agy parent. It is empty otherwise,
+# and _shim.workspace_dir then falls back to personal scope.
+ATLASO_AG_HOST_CWD="$(_atlaso_host_cwd)"
+export ATLASO_AG_HOST_CWD
+
 atlaso_run() {
   local mod="$1"
   if [ -d "$_TOOL_DIR/runtime" ]; then

@@ -5,12 +5,19 @@ and capture after, in both the IDE and the `agy` CLI, via one native plugin.
 
 ## Install
 
-1. Create a free account at [app.atlaso.ai](https://app.atlaso.ai/sign-in) and
-   follow the connect flow for Antigravity, then:
+You need Antigravity's `agy` CLI on your PATH first (the Atlaso CLI installs the
+plugin through `agy plugin install`). Then install the Atlaso CLI and connect
+Antigravity:
 
 ```
-agy plugin install https://github.com/atlaso-labs/antigravity
+curl -fsSL https://atlaso.ai/install.sh | bash
+atlaso connect --tools antigravity
 ```
+
+`atlaso connect` opens your browser to sign in (a free account works) and then
+registers the plugin with agy. Restart Antigravity, or start a fresh `agy`
+session, so it loads the plugin. There is no Git-URL install: `agy plugin install`
+only accepts a local directory.
 
 **What you get**
 
@@ -65,11 +72,11 @@ bundle to a temp dir, then `agy plugin install <dir>`). Installed at:
 ~/.gemini/config/plugins/atlaso/
   plugin.json                REQUIRED marker  {"name":"atlaso", ...}
   mcp_config.json            the Atlaso MCP server (recall/remember/forget/recent/status)
-  hooks.json                 PreInvocation → recall.sh, Stop → capture.sh
+  hooks.json                 SessionStart → start.sh, PreInvocation → recall.sh, Stop → capture.sh
   skills/memory/SKILL.md     model-driven memory skill (when to recall/deposit)
   rules/atlaso.md            standing recall-before-answering / remember-durable rule
   bin/atlaso-memory-mcp      MCP launcher (self-contained via uv)
-  hooks/                     recall.sh + capture.sh + _resolve.sh (lifecycle launchers)
+  hooks/                     start.sh + recall.sh + capture.sh + _resolve.sh (lifecycle launchers)
   runtime/                   vendored atlaso_client + atlaso_mcp + atlaso_ag + dep env
 ```
 
@@ -82,7 +89,9 @@ those must be absolute. The bundled `mcp_config.json` + `hooks.json` ship with a
 `__ATLASO_PLUGIN_DIR__` placeholder, and `install.py` substitutes the real absolute
 install path at copy time so the launchers always resolve.
 
-## Install
+## Install from source (contributors)
+
+Users should use the Atlaso CLI route at the top of this page. From a checkout:
 
 ```bash
 python install.py
@@ -112,9 +121,13 @@ skill + rules tell it when. This path rests on confirmed, primary-source surface
 (the `mcpServers` schema is the stable cross-tool MCP standard; the skill + rules
 are plain plugin content Antigravity loads). It works regardless of anything below.
 
-**2. Hooks — auto-recall + auto-capture (corroborated, NOT smoke-tested).**
+**2. Hooks — session brief, auto-recall, auto-capture (host-verified on the agy versions below).**
 The plugin's `hooks.json` registers:
 
+- **Session brief** (`SessionStart`, fires once per session before the first model
+  call; present and firing in agy 1.2.9 but not on the public hooks page):
+  `hooks/start.sh` -> `atlaso_ag/start.py` calls `client.ambient_start` for the
+  workspace and prints `{"injectSteps":[{"ephemeralMessage": <brief>}]}`.
 - **Auto-recall** (`PreInvocation`, fires before the model call): `hooks/recall.sh`
   → `atlaso_ag/recall.py` recovers the user's latest prompt from the hook's
   `transcriptPath`, calls `client.recall`, and prints
@@ -124,26 +137,24 @@ The plugin's `hooks.json` registers:
   `atlaso_ag/capture.py` reads `transcriptPath`, extracts the last user/assistant
   exchange, saves it locally (`remember(push=False)`), then best-effort `sync_once`.
 
-> ⚠️ **The hook field contract is corroborated but NOT first-party smoke-tested by
-> us.** The PreInvocation injection field (`injectSteps`/`ephemeralMessage` — there
-> is no `additionalContext`/`systemMessage`), the presence of `transcriptPath` on the
-> Stop payload, and the transcript file's on-disk format are all consistent across
-> the official docs + danicat.dev + the GCP migration article + antigravityide.help,
-> but we have not verified them on a live Antigravity install. **They must be
-> validated there.** Everything is designed to **fail open**: if a field name is
-> wrong, recall just prints nothing and capture just no-ops — the turn always
-> proceeds and the MCP + skill path keeps working unchanged. Antigravity uses a
-> `decision` field for control (NOT Claude Code's exit-2-to-block); our hooks never
-> set it, so they can't gate a turn.
+> **What we have verified, and on which agy.** Recall and capture through the
+> plugin's hooks were verified live on agy 1.0.14 (2026-07-16). In the 2026-09-23
+> tool-delivery gauntlet, on an Intel Mac running headless `agy -p` on agy 1.2.9
+> and 1.2.10 against the hosted brain, the SessionStart brief and the PreInvocation
+> recall block were both injected as `injectSteps`/`ephemeralMessage` and the model
+> answered from them. The IDE and agy versions after 1.2.10 were not tested, and
+> the SessionStart event is not on Antigravity's public hooks page, so a later agy
+> could change it. Everything is designed to **fail open**: if a field name
+> changes, recall prints nothing and capture no-ops — the turn always proceeds
+> and the MCP + skill path keeps working unchanged. Antigravity uses a `decision`
+> field for control (NOT Claude Code's exit-2-to-block); our hooks never set it, so
+> they can't gate a turn.
 
-### What still needs live Antigravity validation
-- That a plugin's bundled `hooks.json` `PreInvocation` reads our STDOUT and that
-  `injectSteps`/`ephemeralMessage` actually injects the recalled block.
-- That the `Stop` payload includes `transcriptPath` and that the transcript file's
-  format is parseable by `atlaso_ag/transcript.py` (its parser is format-tolerant —
-  JSONL / single-JSON / wrapper object — but the real shape is undocumented).
-- The exact plugin `hooks.json` group/`enabled`/event-key schema once loaded from
-  inside a plugin bundle (vs. the shared `~/.gemini/config/hooks.json`).
+### Still undocumented upstream
+- The transcript file's on-disk format behind `transcriptPath`
+  (`atlaso_ag/transcript.py` is format-tolerant: JSONL / single-JSON / wrapper
+  object).
+- The plugin `hooks.json` group/`enabled`/event-key schema, and SessionStart itself.
 
 ## Free vs paid
 
@@ -165,12 +176,13 @@ tools/antigravity/
   plugin.json                      plugin marker {"name":"atlaso", ...}
   bin/atlaso-memory-mcp            MCP launcher (dual-mode: built runtime / dev venv)
   atlaso_ag/                       lifecycle hook logic (mirrors claude-code/atlaso_cc)
+    start.py                       SessionStart -> ambient brief as injectSteps/ephemeralMessage
     recall.py                      PreInvocation → injectSteps/ephemeralMessage
     capture.py                     Stop → save last exchange + sync
     transcript.py                  format-tolerant session-log reader
     _shim.py                       read_payload / make_client / log
   hooks/                           shell launchers (dual-mode resolver)
-    _resolve.sh  recall.sh  capture.sh
+    _resolve.sh  start.sh  recall.sh  capture.sh
   config/mcp_config.template.json  → bundle's mcp_config.json (with __ATLASO_PLUGIN_DIR__)
   config/hooks.template.json       → bundle's hooks.json (with __ATLASO_PLUGIN_DIR__)
   skills/memory/SKILL.md           model-driven memory skill (→ plugin skills/)

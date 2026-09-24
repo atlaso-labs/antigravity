@@ -1,8 +1,9 @@
 ## Atlaso memory
 
 You have an `atlaso` MCP server for the user's long-term memory (shared across
-their tools and projects). Antigravity does **not** auto-inject memories, so use it
-deliberately:
+their tools and projects). Relevant memories may already appear as an
+`=== Atlaso Memory ===` block before your first step; use it when relevant, and use the
+server deliberately for anything more:
 
 - **Recall first** when prior context would help — at the start of a task, when the
   user references a past decision, or before a choice that might contradict an

@@ -11,12 +11,56 @@ tools never assume that — they work the same whether or not auto-surfacing exi
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
+
+from atlaso_client import _project
+
+from .ambient_tool_core import PATH_SHAPE, auth_notice, normalize_remote, shape_ambient, valid_project_key
 
 # The polarities a MODEL may assign on remember (Week-1 Step 4). 'pending'
 # ("captured, not yet classified") is deliberately excluded — it belongs to
 # the auto-capture pipeline, never to a deliberate remember.
 REMEMBER_POLARITIES = ("positive", "negative", "cautionary", "open")
+
+
+def _local_project_hint(raw: str | None) -> tuple[str, str | None]:
+    if raw is None:
+        return "not_supplied", None
+    if not isinstance(raw, str) or not raw.strip():
+        return "invalid", None
+    if PATH_SHAPE.match(raw):
+        status, key = _project.project_resolution(Path(raw))
+        if status == "none":
+            return "no_project_folder", None
+        if status != "ok" or not valid_project_key(key):
+            return "unresolved", None
+        return "exact", key
+    key = normalize_remote(raw)
+    return ("exact", key) if valid_project_key(key) else ("invalid", None)
+
+
+def do_ambient(client, project: str | None = None) -> dict[str, Any]:
+    """Use this MCP server's tool identity; never fall back to another bearer."""
+    match, key = _local_project_hint(project)
+    wire = client.ambient_result(project=key)
+    if not isinstance(wire, dict):
+        return shape_ambient("upstream", None, None, match, key)
+    state = wire.get("state")
+    reason = wire.get("reason")
+    if not isinstance(state, str) or (reason is not None and not isinstance(reason, str)):
+        return shape_ambient("upstream", None, None, match, key)
+    if state == "not_entitled":
+        return shape_ambient(402, None, None, match, key)
+    if state == "auth_error":
+        return shape_ambient(401, None, None, match, key,
+                             auth_text=auth_notice(wire.get("auth_cause")))
+    if state == "degraded" and reason == "rate_limited":
+        return shape_ambient(429, None, None, match, key)
+    if state == "degraded" and reason in {"timeout", "upstream"}:
+        return shape_ambient(reason, None, None, match, key)
+    body = {**wire, "scope_version": 1}
+    return shape_ambient(200, body, None, match, key)
 
 # The lab's polarity guide — surfaced VERBATIM in the tool description so the
 # model picks the right bucket (see server.py + server/mcp_app.py wrappers).

@@ -21,6 +21,8 @@ import os
 import uuid
 from typing import Any, Optional
 
+import httpx
+
 from . import _credential, _telemetry, config, state
 from .api import AuthRejected, BrainAPI, EdgeBlocked, NotEntitled
 from .cache import Cache
@@ -499,6 +501,63 @@ class Client:
         except Exception as e:
             self._note_auth_failure(e)
             return None
+
+    def ambient_result(self, *, project: str | None = None) -> dict[str, Any]:
+        """Fetch one fresh, scoped Ambient verdict for the stdio MCP tool.
+
+        Hook callers continue using ambient(), whose null-on-failure behaviour
+        and cache are unchanged. This path does not read or write that cache.
+        """
+        key = self._ambient_project(project, None)
+        result: dict[str, Any] = {
+            "state": "auth_error", "reason": None, "complete": True, "gaps": [],
+            "block": None, "project": key, "tool": self.tool,
+        }
+        if self.api is None or not self.tool:
+            result["auth_cause"] = "not_connected"
+            return result
+        try:
+            status, body, _cause = self.api.ambient_result(project=key, tool=self.tool)
+        except (AuthRejected, NotEntitled) as exc:
+            self._note_auth_failure(exc)
+            result["auth_cause"] = ("not_entitled" if isinstance(exc, NotEntitled)
+                                    else exc.code or "invalid_token")
+            return result
+        except httpx.TimeoutException:
+            result.update(state="degraded", reason="timeout")
+            return result
+        except Exception as exc:
+            self._note_auth_failure(exc)
+            result.update(state="degraded", reason="upstream")
+            return result
+        if status == 402:
+            result["state"] = "not_entitled"
+        elif status == 429:
+            result.update(state="degraded", reason="rate_limited")
+        elif status in (401, 403):
+            result["state"] = "auth_error"
+        elif status == 200 and isinstance(body, dict):
+            if (body.get("scope_version") == 1 and body.get("project") == key
+                    and body.get("tool") == self.tool):
+                state = body.get("state")
+                reason = body.get("reason")
+                gaps = body.get("gaps")
+                complete = body.get("complete")
+                block = body.get("block")
+                if (isinstance(state, str) and state in {"ok", "empty", "withheld", "degraded"}
+                        and (reason is None or isinstance(reason, str))
+                        and isinstance(gaps, list) and all(isinstance(gap, str) for gap in gaps)
+                        and isinstance(complete, bool)
+                        and (block is None or isinstance(block, str))):
+                    result.update(state=state, reason=reason, complete=complete,
+                                  gaps=gaps, block=block)
+                else:
+                    result.update(state="degraded", reason="upstream")
+            else:
+                result.update(state="degraded", reason="upstream")
+        else:
+            result.update(state="degraded", reason="upstream")
+        return result
 
     def ambient_start(self, *, project=_PROJECT_UNSET,
                       project_dir: str | None = None) -> str | None:

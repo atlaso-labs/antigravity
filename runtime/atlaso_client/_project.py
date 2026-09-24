@@ -32,7 +32,7 @@ _MARKERS = (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod",
 # fake project per version-pinned release dir (field deposit 52c7e97d).
 # Membership is by path ANCESTRY over the canonicalized (realpath'd) root —
 # exact-path lists rot on the next versioned release (lab ruling).
-_TOOL_DOT_DIRS = {".claude", ".codex", ".gemini", ".vscode",
+_TOOL_DOT_DIRS = {".claude", ".codex", ".gemini", ".grok", ".vscode",
                   ".opencode", ".atlaso", "node_modules", "site-packages",
                   "__pypackages__", ".cache", "Caches"}
 

@@ -3,8 +3,8 @@ name: memory
 description: >-
   Atlaso long-term memory for Antigravity. Use to RECALL relevant past context
   before answering, and to REMEMBER durable facts, decisions, preferences, and
-  gotchas worth keeping across sessions. Unlike some tools, Antigravity does NOT
-  auto-inject memories — you must call recall yourself when prior context would help.
+  gotchas worth keeping across sessions. Relevant memories may already arrive as an
+  "=== Atlaso Memory ===" block before your first step; call recall when you need more.
 when_to_use: >-
   starting a task where past decisions/preferences likely matter; the user
   references something decided earlier; you're about to make a choice that could
@@ -15,14 +15,15 @@ when_to_use: >-
 # Using Atlaso memory in Antigravity
 
 Atlaso is the user's long-term memory, shared across every tool and project. On
-Antigravity, memory is **model-driven**: there is no automatic per-turn injection,
-so reach for the `Atlaso` MCP tools deliberately.
+Antigravity, a hook recalls once per turn and, when something matches, injects an
+`=== Atlaso Memory ===` block before your first step. Use it when it is relevant.
+Beyond that, memory is **model-driven**: reach for the `Atlaso` MCP tools deliberately.
 
 The `Atlaso` MCP server exposes: `recall`, `remember`, `forget`, `recent`, `status`.
 
 ## Recall before you answer (the one habit that matters)
 
-Because nothing is auto-injected here, **call `recall` at the start of a task** when
+If the injected block does not cover it, **call `recall` at the start of a task** when
 prior context would plausibly help:
 - the user references a past decision ("what did we decide about X?"),
 - you're starting unfamiliar work in this project,

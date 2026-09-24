@@ -20,6 +20,7 @@ NO raw prompt (it lives in the transcript) — and Antigravity injects an
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -81,6 +82,7 @@ def run(payload: dict, client) -> dict | None:
     session = payload.get("conversationId") or payload.get("conversation_id")
     res = client.recall(prompt, limit=limit, project=project, session=session)
     block = render(res.get("results", []))
+    _log_fired(prompt, res, block, session)
     notice = _degraded_notice(res, client)
     steps = []
     if notice:
@@ -90,6 +92,20 @@ def run(payload: dict, client) -> dict | None:
     if not steps:
         return None
     return {"injectSteps": steps}
+
+
+def _log_fired(prompt: str, res, block, session) -> None:
+    """Debug-only proof the per-turn recall fired (ATLASO_DEBUG=1; AG-12), in the
+    shape of the Codex and Grok hook lines: where the answer came from (server, or
+    the local-cache floor), how many notes, whether a block was made, a short hash of
+    the query so a check can tie the line to one prompt, and the conversation id so
+    it can be tied to one agy session. Counts only: never the prompt or any memory
+    text."""
+    res = res if isinstance(res, dict) else {}
+    n = len(res.get("results") or [])
+    q_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
+    _shim.log("recall", f"fired tool={_shim.TOOL} source={res.get('source')} results={n} "
+                        f"injected={bool(block)} q_sha={q_sha} conv={session or ''}")
 
 
 _DEGRADED_TEXT = ("Atlaso · cloud recall isn't responding — memory is running from this device's local cache "
@@ -154,6 +170,8 @@ def main() -> int:
             client.close()
         except Exception:
             pass
+    steps = len((out or {}).get("injectSteps") or [])
+    _shim.log("recall", f"inv={payload.get('invocationNum')} ws={_shim.workspace_dir(payload)} steps={steps}")
     if out:
         print(json.dumps(out))
     return 0

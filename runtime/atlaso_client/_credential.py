@@ -142,6 +142,21 @@ class ToolNotEntitled(Exception):
     per-tool credentials close. Run local-only."""
 
 
+def _refusal_meaning(code: str) -> str:
+    """Interpret only the verified cause header, never the HTTP status alone."""
+    if code in {"credential_revoked", "tool_revoked"}:  # legacy drain
+        return "revoked"
+    if code in {"not_entitled", "tool_switch_needed"}:
+        return "unselected"
+    if code == "device_limit_reached":
+        return "cap"
+    if code == "plan_unresolved":
+        return "unresolved"
+    if code == "entitlement_required":
+        return "entitlement_required"
+    return "unknown"
+
+
 def _exchange(server: str, token: str, tool: str, *, timeout: float = 8.0) -> Optional[dict]:
     """Trade a live credential of this device for one belonging to `tool`.
 
@@ -171,11 +186,14 @@ def _exchange(server: str, token: str, tool: str, *, timeout: float = 8.0) -> Op
     # A verdict counts only if it is verifiably OURS. An edge/WAF page can wear any
     # status code it likes; it cannot set this header.
     verified = r.headers.get("x-atlaso-response") == "1"
-    code = r.headers.get("x-atlaso-error", "")
-    if verified and r.status_code == 403 and code == "tool_revoked":
-        raise ToolRemoved(tool)
-    if verified and r.status_code == 409:
-        raise ToolNotEntitled(tool)
+    if verified:
+        meaning = _refusal_meaning(r.headers.get("x-atlaso-error", ""))
+        if meaning == "revoked":
+            raise ToolRemoved(tool)
+        if meaning == "unselected":
+            raise ToolNotEntitled(tool)
+        # Cap, unresolved, missing-entitlement and unknown causes are retryable or
+        # unsafe to interpret here. Preserve the credential and try again later.
     return None  # unverified → caller keeps the shared bearer and retries next run
 
 
