@@ -175,14 +175,94 @@ def _tokens(s: str) -> set[str]:
     return set(re.findall(r"\w+", (s or "").lower()))
 
 
-def near_dup(new: str, existing: str, jaccard: float = 0.85, containment: float = 0.95) -> bool:
-    """True when `new` adds essentially nothing over `existing` (so skip it). High
-    Jaccard = near-twins; high containment of new-in-existing = new ⊆ existing. A
-    richer/longer new statement is kept (containment drops below the bar)."""
+def _bag_similar(new: str, existing: str, jaccard: float = 0.85,
+                 containment: float = 0.95) -> bool:
+    """The legacy bag-of-words test: high Jaccard (near-twins) or high containment of
+    new-in-existing (new ⊆ existing). Blind to word order and to which word changed."""
     tn, te = _tokens(new), _tokens(existing)
     if not tn or not te:
         return False
     inter = len(tn & te)
-    jacc = inter / len(tn | te)
-    contain_new = inter / len(tn)
-    return jacc >= jaccard or contain_new >= containment
+    return inter / len(tn | te) >= jaccard or inter / len(tn) >= containment
+
+
+# Words that add no content: a twin that only adds these is still a duplicate
+# ("Note that …", "Heads up: …", "… here."). Anything else it adds is new content.
+_NO_CONTENT = frozenset((
+    "a an the and or but so to of in on at for with by from is are was were be been it its "
+    "this that these those we our us i you your my here there now just also note heads up "
+    "please remember important rule fyi ok okay").split())
+# Words whose neighbours carry the direction of a change ("from A to B").
+_DIRECTION = frozenset("from to instead over back replaced replace switched moved".split())
+# Past-tense framings: a statement ABOUT an old value, never an adoption of it.
+_PAST_FRAMING = re.compile(
+    r"\b(?:back when|used to|we had|before (?:we|the) (?:move|moved|switch|switched|migrat\w*)"
+    r"|previously|originally)\b", re.I)
+_ADOPT_LEAD = frozenset(("to", "use", "using", "adopt", "adopting"))
+
+
+def value_tokens(s: str) -> list[str]:
+    """Tokens that keep - . / : inside a value, so eu-west-1 or /api/v2 stays one token."""
+    return re.findall(r"\w[\w\-./:]*\w|\w", (s or "").lower())
+
+
+def _direction_pairs(s: str) -> set[tuple[str, str]]:
+    t = value_tokens(s)
+    return {(a, b) for a, b in zip(t, t[1:]) if a in _DIRECTION or b in _DIRECTION}
+
+
+def near_kind(new: str, existing: str, jaccard: float = 0.85,
+              containment: float = 0.95) -> str | None:
+    """How `new` relates to `existing`:
+      None        — not a near-twin (keep; unrelated or richer);
+      "update"    — a near-twin that changes something: (i) it adds a content word the
+                    existing memory lacks (a substituted value), or (ii) it reverses a
+                    direction ("from B to A" against "from A to B"). Keep it — dropping it
+                    would silently lose the change;
+      "duplicate" — a near-twin that adds nothing (skip it)."""
+    if not _bag_similar(new, existing, jaccard, containment):
+        return None
+    if (_tokens(new) - _tokens(existing)) - _NO_CONTENT:  # rule (i): new content
+        return "update"
+    if _direction_pairs(new) - _direction_pairs(existing):  # rule (ii): other direction
+        return "update"
+    return "duplicate"
+
+
+def near_dup(new: str, existing: str, jaccard: float = 0.85, containment: float = 0.95) -> bool:
+    """True when `new` adds nothing over `existing` (so skip it): bag-similar AND no new
+    content word AND no new direction pair. A substituted value or a mirrored change is
+    an update and is kept (see near_kind)."""
+    return near_kind(new, existing, jaccard, containment) == "duplicate"
+
+
+_FROM_SLOT = frozenset(("from", "over", "instead", "replaced", "replace"))
+
+
+def replaced_value(old: str, superseder: str) -> set[str]:
+    """The value `superseder` replaced in `old`: the tokens in the superseder's
+    "from X" / "over X" / "instead of X" slot that `old` also contains; for a same-shape
+    update without such a slot, the content tokens `old` has and the superseder lacks
+    ("port 5433" vs "port 55432" -> {"5433"})."""
+    t_old, t_sup = set(value_tokens(old)), value_tokens(superseder)
+    slot = {b for a, b in zip(t_sup, t_sup[1:]) if a in _FROM_SLOT} & t_old
+    slot |= {c for a, b, c in zip(t_sup, t_sup[1:], t_sup[2:])
+             if (a, b) == ("instead", "of")} & t_old
+    return (slot or (t_old - set(t_sup))) - _NO_CONTENT
+
+
+def adopts_value(new: str, values: "set[str] | frozenset[str]") -> bool:
+    """True when `new` ADOPTS one of `values` ("going back to A", "switch from B
+    to A", "use A again"); False for past-tense framings ("back when we used A", "we
+    used to use A before …"). Conservative by design: it gates writing a supersedes
+    edge, and a false edge hides the current value silently."""
+    vals = {v for v in values if v and v not in _NO_CONTENT}
+    if not vals or _PAST_FRAMING.search(new or ""):
+        return False
+    t = value_tokens(new)
+    for i, tok in enumerate(t):
+        if tok in _ADOPT_LEAD and vals & set(t[i + 1:i + 4]):
+            return True
+        if tok == "again" and vals & set(t[max(0, i - 4):i]):
+            return True
+    return False

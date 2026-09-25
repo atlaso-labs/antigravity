@@ -20,6 +20,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
+from typing import Any
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cached_deposits (
@@ -86,6 +87,16 @@ CREATE TABLE IF NOT EXISTS capture_stats (
     -- map itself.
     hours_json TEXT NOT NULL DEFAULT '{}'
 );
+
+-- Local supersession marks (id is superseded by by_id). Written by the client's
+-- edge writer when a supersedes edge is recorded; read by capture's near-dup
+-- search, which compares only against LIVE memories and treats a twin of a
+-- superseded memory as a revert (kept), never as a duplicate.
+CREATE TABLE IF NOT EXISTS superseded (
+    id     TEXT PRIMARY KEY,
+    by_id  TEXT NOT NULL,
+    at     TEXT NOT NULL
+);
 """
 
 # Additive column migrations for caches created by older clients. Applied
@@ -94,6 +105,52 @@ _MIGRATIONS = (
     "ALTER TABLE outbox ADD COLUMN edge_blocks INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE capture_stats ADD COLUMN hours_json TEXT NOT NULL DEFAULT '{}'",
 )
+
+
+# Capture's near-dup bucket (rung 404a1485). Two plain nullable columns on
+# cached_deposits, written in PYTHON by this client's own writers (upsert_deposit,
+# enqueue, rekey_scope after the _reconcile raw-SQL tag rewrite) and backfilled once
+# by Python when they are added. No trigger, index or other schema object: a cache
+# file stays writable by every client, including older clients on a SQLite build
+# without JSON functions (round-2 finding D-092).
+#   scope_key  = the row's (scope, project, project-unknown) bucket, see _scope_key_of;
+#   scope_tags = the exact tags_json string scope_key was computed from.
+# A row is trusted only when scope_key is set AND scope_tags still equals tags_json.
+# Rows inserted by older clients carry NULL; rows whose tags an older client changed
+# carry a stale scope_tags. Both are re-checked with the Python scope filter.
+_SCOPE_COLUMNS = ("scope_key", "scope_tags")
+# The round-2 build dc34871ff (withdrawn, never released) installed these; they call
+# JSON functions on every write, so a cache that build touched loses them on open.
+_WITHDRAWN_TRIGGERS = ("cached_deposits_scope_key_ai", "cached_deposits_scope_key_au")
+
+
+def _row_tags(tags_json: str | None) -> list[Any]:
+    """A cached row's tags as the Python readers see them: malformed JSON or a
+    non-list value reads as [] (personal)."""
+    try:
+        tags = json.loads(tags_json) if tags_json else []
+    except (ValueError, TypeError):
+        return []
+    return tags if isinstance(tags, list) else []
+
+
+def _scope_key(scope: str, project: str | None, unknown: bool) -> str:
+    """The scope_key of the bucket (scope, project, project-unknown marker)."""
+    return f"{scope}|{'u' if unknown else 'k'}|{'-' if project is None else '=' + project}"
+
+
+def _scope_key_of(tags: list[Any]) -> str:
+    """A row's scope_key, from _project.scope_of (the capture filter's own
+    definition). Orphaned rows key as 'orphaned|…', which no capture bucket matches."""
+    from . import _project
+    scope, project = _project.scope_of(tags)
+    return _scope_key(scope, project, "project-unknown" in tags)
+
+
+def _in_bucket(tags: list[Any], scope: str, project: str | None, unknown: bool) -> bool:
+    """The Python scope filter for rows without a trusted scope_key."""
+    return _scope_key_of(tags) == _scope_key(scope, project, unknown)
+
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
@@ -149,6 +206,64 @@ class Cache:
             except sqlite3.OperationalError:
                 pass  # already migrated (duplicate column) — expected
         self._conn.commit()
+        self._scope_key_ready = self._ensure_scope_columns()
+
+    def _ensure_scope_columns(self) -> bool:
+        """Make the cache ready for the scoped near-dup search. On a cache already
+        migrated by this client this is two read-only catalogue reads (no write lock).
+        Otherwise, in ONE write transaction: drop the withdrawn round-2 triggers, add
+        the scope columns and key every row in Python. False when that cannot happen
+        now (locked or read-only file); near-dup then Python-filters every candidate."""
+        cols = self._columns()
+        stale_triggers = self._withdrawn_triggers()
+        if not stale_triggers and all(c in cols for c in _SCOPE_COLUMNS):
+            return True
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            for name in _WITHDRAWN_TRIGGERS:
+                self._conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            cols = self._columns()
+            for col in _SCOPE_COLUMNS:
+                if col not in cols:
+                    self._conn.execute(f"ALTER TABLE cached_deposits ADD COLUMN {col} TEXT")
+            self._rekey_scope(everything=True)  # one-time backfill, same transaction
+            self._conn.commit()
+            return True
+        except sqlite3.OperationalError:
+            self._conn.rollback()
+            # ready only if another client finished the job meanwhile: a surviving
+            # withdrawn trigger may rewrite scope_key, so it keeps the cache not-ready
+            return not self._withdrawn_triggers() and all(
+                c in self._columns() for c in _SCOPE_COLUMNS)
+
+    def _columns(self) -> set[str]:
+        return {r[1] for r in self._conn.execute("PRAGMA table_info(cached_deposits)")}
+
+    def _withdrawn_triggers(self) -> list[str]:
+        return [r[0] for r in self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name IN (?, ?)",
+            _WITHDRAWN_TRIGGERS)]
+
+    def _rekey_scope(self, *, everything: bool = False) -> int:
+        """Recompute scope_key/scope_tags in Python for every row whose key is missing
+        or stale (or for every row when `everything`). No commit: the caller owns the
+        transaction. Returns the number of rows keyed."""
+        where = "" if everything else " WHERE scope_key IS NULL OR scope_tags IS NOT tags_json"
+        rows = self._conn.execute("SELECT id, tags_json FROM cached_deposits" + where).fetchall()
+        self._conn.executemany(
+            "UPDATE cached_deposits SET scope_key = ?, scope_tags = ? WHERE id = ?",
+            [(_scope_key_of(_row_tags(r["tags_json"])), r["tags_json"], r["id"]) for r in rows])
+        return len(rows)
+
+    def rekey_scope(self) -> int:
+        """Re-key rows whose tags changed outside this class (the _reconcile raw-SQL
+        tag rewrite, or an older client sharing the file) and commit. Returns the
+        number of rows keyed; 0 when the scope columns are not installed."""
+        if not self._scope_key_ready:
+            return 0
+        n = self._rekey_scope()
+        self._conn.commit()
+        return n
 
     def close(self) -> None:
         self._conn.close()
@@ -222,6 +337,16 @@ class Cache:
                 (deposit_id, content),
             )
 
+    def _scope_write(self, tags_json: str) -> tuple[str, str, str, tuple[str, ...]]:
+        """SQL fragments + values that key a row being written with `tags_json`:
+        (column list, placeholders, ON CONFLICT assignments, values). Empty when the
+        scope columns are not installed (the row is then keyed by the next migration)."""
+        if not self._scope_key_ready:
+            return "", "", "", ()
+        return (", scope_key, scope_tags", ",?,?",
+                ", scope_key=excluded.scope_key, scope_tags=excluded.scope_tags",
+                (_scope_key_of(_row_tags(tags_json)), tags_json))
+
     # ── server → cache (pull) ────────────────────────────────────────────────
     def upsert_deposit(
         self,
@@ -236,16 +361,18 @@ class Cache:
         tags: list[str] | None = None,
         retracted: bool = False,
     ) -> None:
+        tags_json = json.dumps(tags or [])
+        cols, marks, sets, extra = self._scope_write(tags_json)
         self._conn.execute(
             "INSERT INTO cached_deposits"
             "(id, seq, content, polarity, evidence_grade, scope_note, created_at, "
-            " tags_json, retracted, pending) VALUES(?,?,?,?,?,?,?,?,?,0) "
+            " tags_json, retracted, pending" + cols + ") VALUES(?,?,?,?,?,?,?,?,?,0" + marks + ") "
             "ON CONFLICT(id) DO UPDATE SET seq=excluded.seq, content=excluded.content, "
             "polarity=excluded.polarity, evidence_grade=excluded.evidence_grade, "
             "scope_note=excluded.scope_note, created_at=excluded.created_at, "
-            "tags_json=excluded.tags_json, retracted=excluded.retracted, pending=0",
+            "tags_json=excluded.tags_json, retracted=excluded.retracted, pending=0" + sets,
             (id, seq, content, polarity, evidence_grade, scope_note, created_at,
-             json.dumps(tags or []), 1 if retracted else 0),
+             tags_json, 1 if retracted else 0, *extra),
         )
         self._index_fts(id, content, retracted=retracted)
         self._conn.commit()
@@ -271,11 +398,13 @@ class Cache:
             (client_id, text, polarity, evidence_grade, scope_note, tags_json, created_at),
         )
         # optimistic local row so recall sees it immediately (pending=1, no seq yet)
+        cols, marks, _, extra = self._scope_write(tags_json)
         self._conn.execute(
             "INSERT OR REPLACE INTO cached_deposits"
             "(id, seq, content, polarity, evidence_grade, scope_note, created_at, "
-            " tags_json, retracted, pending) VALUES(?,?,?,?,?,?,?,?,0,1)",
-            (client_id, None, text, polarity, evidence_grade, scope_note, created_at, tags_json),
+            " tags_json, retracted, pending" + cols + ") VALUES(?,?,?,?,?,?,?,?,0,1" + marks + ")",
+            (client_id, None, text, polarity, evidence_grade, scope_note, created_at, tags_json,
+             *extra),
         )
         self._index_fts(client_id, text)
         self._conn.commit()
@@ -364,6 +493,11 @@ class Cache:
             return
 
         if server_id and server_id != client_id:
+            # supersession marks follow the rekey (either side of the edge)
+            self._conn.execute("UPDATE OR IGNORE superseded SET id = ? WHERE id = ?",
+                               (server_id, client_id))
+            self._conn.execute("UPDATE superseded SET by_id = ? WHERE by_id = ?",
+                               (server_id, client_id))
             exists = self._conn.execute(
                 "SELECT 1 FROM cached_deposits WHERE id = ?", (server_id,)
             ).fetchone()
@@ -415,6 +549,86 @@ class Cache:
                 "created_at": r["created_at"], "tags": tags, "pending": bool(r["pending"]),
             })
         return out
+
+    # ── capture near-dup candidates (scoped, live/superseded) ────────────────
+    def near_dup_candidates(self, query: str, limit: int, *, scope: str,
+                            project: str | None, unknown: bool,
+                            superseded: bool = False) -> list[dict[str, Any]]:
+        """Top-`limit` keyword hits (bm25 order) for capture's near-dup check, taken
+        ONLY from the capture's own bucket, so other projects' rows can never crowd
+        the same-project twin out:
+          scope='project', project=K  → rows tagged scope:project whose project tag is K
+          scope='project', project=None → unattributed project rows (no project: tag)
+          scope='personal'            → rows with neither scope:project nor a project: tag
+        `unknown` must match the row's project-unknown marker; orphaned rows never
+        match. SQL keeps rows with a trusted scope_key equal to the bucket's, plus rows
+        without a trusted key (NULL: written by an older client; stale: tags changed
+        since keying). Only those untrusted rows go through the Python scope filter,
+        and it runs BEFORE the `limit` cut. superseded=False returns LIVE rows only;
+        True returns only rows marked superseded (with `superseded_by`), and skips the
+        search outright while the superseded table is empty."""
+        q = _fts_query(query)
+        if not q:
+            return []
+        if superseded and self._conn.execute(
+                "SELECT NOT EXISTS (SELECT 1 FROM superseded)").fetchone()[0]:
+            return []
+        live = "s.id IS NOT NULL" if superseded else "s.id IS NULL"
+        if self._scope_key_ready:
+            keyed = "(d.scope_key IS NOT NULL AND d.scope_tags IS d.tags_json)"
+            where, args = f"(d.scope_key = ? OR NOT {keyed})", [_scope_key(scope, project, unknown)]
+        else:  # columns not installed yet (locked/read-only at open): filter every row
+            keyed, where, args = "0", "1", []
+        cur = self._conn.execute(
+            f"SELECT d.id, d.content, d.tags_json, s.by_id, {keyed} AS keyed "
+            "FROM cached_fts f JOIN cached_deposits d ON d.id = f.deposit_id "
+            "LEFT JOIN superseded s ON s.id = d.id "
+            f"WHERE cached_fts MATCH ? AND d.retracted = 0 AND {live} AND {where} "
+            "ORDER BY bm25(cached_fts)",
+            [q, *args])
+        out: list[dict[str, Any]] = []
+        try:
+            for r in cur:
+                tags = _row_tags(r["tags_json"])
+                if not r["keyed"] and not _in_bucket(tags, scope, project, unknown):
+                    continue
+                out.append({"id": r["id"], "content": r["content"], "tags": tags,
+                            "superseded_by": r["by_id"]})
+                if len(out) >= limit:
+                    break
+        finally:
+            cur.close()  # release the read statement before capture writes
+        return out
+
+    def mark_superseded(self, old_id: str, by_id: str) -> None:
+        """Record that `old_id` is superseded by `by_id` (the edge writer calls this
+        once the supersedes edge is recorded)."""
+        self._conn.execute(
+            "INSERT INTO superseded(id, by_id, at) VALUES(?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET by_id = excluded.by_id, at = excluded.at",
+            (old_id, by_id, _now_iso()))
+        self._conn.commit()
+
+    def content_of(self, deposit_id: str) -> str | None:
+        """Content of a non-retracted cached memory, or None."""
+        r = self._conn.execute(
+            "SELECT content FROM cached_deposits WHERE id = ? AND retracted = 0",
+            (deposit_id,)).fetchone()
+        return r["content"] if r else None
+
+    def live_superseder(self, deposit_id: str, max_hops: int = 32) -> str | None:
+        """Follow superseded → by_id to the live head of the chain; None when
+        `deposit_id` is not superseded (or the chain loops)."""
+        cur, seen = deposit_id, set[str]()
+        while len(seen) < max_hops:
+            r = self._conn.execute("SELECT by_id FROM superseded WHERE id = ?", (cur,)).fetchone()
+            if r is None:
+                return None if cur == deposit_id else cur
+            if cur in seen:
+                return None
+            seen.add(cur)
+            cur = r["by_id"]
+        return None
 
     def recent(self, limit: int = 10) -> list[dict]:
         """Most-recent memories from the cache (offline fallback for `recent`).

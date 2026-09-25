@@ -123,6 +123,7 @@ def _retag_local(cache, matched_keys: list[str]) -> None:
             pass
     try:
         cache._conn.commit()
+        cache.rekey_scope()  # the raw-SQL rewrite changed tags; re-key near-dup buckets
     except Exception:
         pass
 

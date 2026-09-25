@@ -40,6 +40,18 @@ _SYNC_PAGE = 500
 _STATS_DAYS = 35
 
 
+# Routing hints a saved capture may carry for the supersede writer. No edge is
+# written by capture: update_of = a live near-twin it changes; revert_of = a
+# superseded near-twin it restates; supersedes = revert_of's live superseder, only
+# when the new text adopts the old value. revert_of/supersedes are hints only until
+# Card A ships.
+_ROUTE_HINTS = ("update_of", "revert_of", "supersedes")
+
+
+def _route_hints(related: dict[str, Any]) -> dict[str, Any]:
+    return {k: related[k] for k in _ROUTE_HINTS if related.get(k)}
+
+
 class Client:
     """Tool-agnostic memory client. Construct once per process where possible
     (keeps the cache + keep-alive connection warm); cheap to construct per hook
@@ -338,15 +350,9 @@ class Client:
             if proj:
                 tags.append(f"project:{proj}")
             # near-dup vs the local commodity cache (offline-safe; no server call)
-            try:
-                for e in self.cache.keyword_search(content[:200], 5):
-                    if (_project.scope_of((e or {}).get("tags")) == (scope, proj)
-                            and ("project-unknown" in ((e or {}).get("tags") or []))
-                            == ("project-unknown" in tags)
-                            and _capture.near_dup(content, (e or {}).get("content", ""))):
-                        return {"saved": False, "reason": "near_dup"}
-            except Exception:
-                pass
+            related = self._near_dup_route(content, tags, scope, proj)
+            if related.get("duplicate"):
+                return {"saved": False, "reason": "near_dup"}
             # Capture polarity (Week-1 Step 4): default "open" (legacy). With
             # ATLASO_CAPTURE_PENDING=1, auto-captures land as "pending" — the
             # honest "not yet classified" state the async classifier drains.
@@ -358,9 +364,58 @@ class Client:
                 else "open"
             )
             cid = self.remember(content, polarity=capture_polarity, tags=tags, push=push)
-            return {"saved": True, "id": cid, "scope": scope, "project": proj}
+            return {"saved": True, "id": cid, "scope": scope, "project": proj,
+                    **_route_hints(related)}
         except Exception:
             return {"saved": False, "reason": "error"}
+
+    def _near_dup_route(self, content: str, tags: list[str], scope: str,
+                        proj: str | None) -> dict[str, Any]:
+        """_near_dup_scan, fail-open: a cache or search error keeps the capture
+        (returns {}), exactly as the pre-rung inline check did."""
+        try:
+            return self._near_dup_scan(content, tags, scope, proj)
+        except Exception:
+            return {}
+
+    def _near_dup_scan(self, content: str, tags: list[str], scope: str,
+                       proj: str | None) -> dict[str, Any]:
+        """Capture's near-dup check against the local cache, in the capture's own
+        (scope, project, project-unknown) bucket, filtered in SQL before the top-5
+        limit so other projects' rows cannot crowd the same-project twin out.
+          LIVE twin that adds nothing           → {"duplicate": id}   (skip)
+          LIVE twin with a new value/direction  → {"update_of": id}    (keep)
+          twin of a SUPERSEDED memory H         → {"revert_of": H}     (keep), plus
+            {"supersedes": S} (S = H's live superseder) only when the new text adopts
+            H's value ("back to A", "from B to A", "use A again"), never on
+            past-tense framings — a false edge would hide the current value."""
+        from . import _capture, _project
+        unknown = "project-unknown" in tags
+        q = content[:200]
+
+        def bucket(superseded: bool) -> list[dict[str, Any]]:
+            rows = self.cache.near_dup_candidates(
+                q, 5, scope=scope, project=proj, unknown=unknown, superseded=superseded)
+            return [e for e in rows if _project.scope_of(e.get("tags")) == (scope, proj)]
+        out: dict[str, Any] = {}
+        for e in bucket(False):
+            kind = _capture.near_kind(content, e.get("content") or "")
+            if kind == "duplicate":
+                return {"duplicate": e["id"]}
+            if kind == "update" and "update_of" not in out:
+                out["update_of"] = e["id"]
+        for h in bucket(True):
+            if _capture.near_kind(content, h.get("content") or "") != "duplicate":
+                continue
+            out["revert_of"] = h["id"]
+            head = self.cache.live_superseder(h["id"])
+            head_text = self.cache.content_of(head) if head else None
+            if head_text:
+                value = _capture.replaced_value(h.get("content") or "", head_text)
+                if _capture.adopts_value(content, value):
+                    out["supersedes"] = head
+            break
+        return out
 
     # ── read ─────────────────────────────────────────────────────────────────
     def recall(self, query: str, limit: int = 5, project: str | None = None,
