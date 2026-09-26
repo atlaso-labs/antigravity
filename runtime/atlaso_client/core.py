@@ -25,7 +25,7 @@ import httpx
 
 from . import _credential, _telemetry, config, state
 from .api import AuthRejected, BrainAPI, EdgeBlocked, NotEntitled
-from .cache import Cache
+from .cache import LONG_MAINTENANCE_S, Cache
 
 # Sentinel for capture(project=…): distinguishes "caller didn't say — derive
 # from the environment" (default) from an explicit None = "this session has NO
@@ -466,17 +466,30 @@ class Client:
 
     def forget(self, deposit_id: str) -> bool:
         """Delete a memory by id, on the server AND in the local cache. Returns
-        True only on a confirmed server delete. Offline → False (left untouched so
-        it can't silently resurrect on the next pull); caller can report that."""
+        True when the logical forget succeeded: the server retracted it and the
+        local rows are gone. Offline → False (left untouched so it can't silently
+        resurrect on the next pull); caller can report that. forget_detail() also
+        says whether the text has left the cache file's bytes yet."""
+        return bool(self.forget_detail(deposit_id)["forgotten"])
+
+    def forget_detail(self, deposit_id: str) -> dict[str, Any]:
+        """forget() with the byte cleanup reported separately:
+        {"forgotten": bool, "local_cache_cleanup": "done" | "pending" | None}.
+        'pending' is not a failed forget: the memory is already gone from recall
+        and export; another process's open read snapshot keeps its bytes in the
+        file a little longer, and the next forget, sync or open removes them."""
         if not self._online():
-            return False
+            return {"forgotten": False, "local_cache_cleanup": None}
         try:
             self.api.delete(deposit_id)
         except Exception as e:
             self._note_auth_failure(e)
-            return False
+            return {"forgotten": False, "local_cache_cleanup": None}
         self.cache.remove(deposit_id)
-        return True
+        from . import _ambient
+        _ambient.purge()  # snapshots are copies of recalled text: rebuilt on sync
+        done = self.cache.scrub()  # the forgotten text leaves the file's bytes too
+        return {"forgotten": True, "local_cache_cleanup": "done" if done else "pending"}
 
     def recent(self, limit: int = 10) -> list[dict]:
         """Most-recent memories — from the server when online, the local cache when
@@ -668,13 +681,16 @@ class Client:
         local housekeeping and their failure does not un-complete a round-trip.
         """
         if not self._online():
+            self._background_maintenance()
             return {"pushed": 0, "pulled": 0, "synced": False}
         try:
             pushed = len(self._push())
             pulled = self._pull()
         except Exception as e:
             self._note_auth_failure(e)
+            self._background_maintenance()
             return {"pushed": 0, "pulled": 0, "synced": False}
+        self._background_maintenance()
         # One-shot junk-project-key rescue (the plugin-cwd bug) — only this
         # machine can prove which legacy keys are junk. Best-effort; marker
         # inside makes it a no-op forever after the first success.
@@ -915,50 +931,57 @@ class Client:
             ch_since = self.cache.get_changes_cursor()
             res = self.api.sync(since, tomb_since=tomb_since, limit=_SYNC_PAGE,
                                 changes_cursor=ch_since)
+            # forgets first: each tombstone lands in the cache's durable forget
+            # filter before any row of this page is written, and upsert_deposit
+            # refuses a forgotten id on this page and on every later one, so no
+            # page order or cursor state can bring a forgotten memory back.
+            gen = self.cache.deleted_generation()
+            tombstones = [t["id"] for t in res.get("tombstones", []) if t.get("id")]
+            for tid in tombstones:
+                self.cache.remove(tid)
             deposits = res.get("deposits", [])
-            for d in deposits:
+            # then the deposit page, then the change stream (full current state of
+            # memories UPDATED in place since our changes cursor — polarity,
+            # retraction, evidence grade); the same idempotent upsert applies both.
+            for d in [*deposits, *res.get("changes", [])]:
                 self.cache.upsert_deposit(
                     id=d["id"], seq=d.get("seq"), content=d.get("content", ""),
                     polarity=d.get("polarity"), evidence_grade=d.get("evidence_grade"),
                     scope_note=d.get("scope_note"), created_at=d.get("created_at"),
                     tags=d.get("tags") or [], retracted=bool(d.get("retracted")),
                 )
-            # change stream: full current state of memories UPDATED in place on the
-            # server (polarity reclassification, retraction tags, evidence grade)
-            # since our changes cursor — the same idempotent upsert applies them.
-            for d in res.get("changes", []):
-                self.cache.upsert_deposit(
-                    id=d["id"], seq=d.get("seq"), content=d.get("content", ""),
-                    polarity=d.get("polarity"), evidence_grade=d.get("evidence_grade"),
-                    scope_note=d.get("scope_note"), created_at=d.get("created_at"),
-                    tags=d.get("tags") or [], retracted=bool(d.get("retracted")),
-                )
-            # apply forgets from other devices — prune them from the local cache/FTS.
-            # Deliberately LAST within a page: if the same id appears in deposits/
-            # changes and tombstones, the deletion must win (never resurrect).
-            for t in res.get("tombstones", []):
-                if t.get("id"):
-                    self.cache.remove(t["id"])
+            if tombstones or self.cache.deleted_generation() > gen:
+                # a memory forgotten or retracted elsewhere may sit in an Ambient
+                # snapshot here: delete them (inspection-only, rebuilt on refresh)
+                from . import _ambient
+                _ambient.purge()
             pulled += len(deposits)
             next_cursor = int(res.get("next_cursor", since))
             next_tomb = int(res.get("next_tomb_cursor", tomb_since))
             next_ch = int(res.get("changes_cursor", ch_since))
-            advanced = False
-            if next_cursor > since:
-                self.cache.set_cursor(next_cursor)
-                advanced = True
-            if next_tomb > tomb_since:
-                self.cache.set_tomb_cursor(next_tomb)
-                advanced = True
-            if next_ch > ch_since:
-                self.cache.set_changes_cursor(next_ch)
-                advanced = True
+            # the three cursors move together, in one transaction, and never back
+            advanced = next_cursor > since or next_tomb > tomb_since or next_ch > ch_since
+            if advanced:
+                self.cache.advance_cursors(deposit=max(next_cursor, since),
+                                           tomb=max(next_tomb, tomb_since),
+                                           changes=max(next_ch, ch_since))
             more = (res.get("has_more") or res.get("has_more_tomb")
                     or res.get("has_more_changes"))
             # stop when all drained, or if no cursor advanced (loop guard)
             if not more or not advanced:
                 break
         return pulled
+
+    def _background_maintenance(self) -> None:
+        """End of every sync, online or not: remove the bytes of text deleted by
+        this pull's tombstones and retracted rows (one read when nothing is owed),
+        and run what an open deferred, e.g. the VACUUM of a large file written by
+        an older client. sync_once is the detached background path on every
+        connector, so this is the 30 s maintenance path. Never raises."""
+        try:
+            self.cache.maintain(LONG_MAINTENANCE_S, long=True)
+        except Exception:
+            pass
 
     # ── introspection ────────────────────────────────────────────────────────
     def status(self) -> dict:

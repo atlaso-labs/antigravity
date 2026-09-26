@@ -110,10 +110,49 @@ def do_remember(client, text: str, polarity: str) -> dict[str, Any]:
     return {"saved": True, "id": cid}
 
 
+# Shown when a forget succeeded but this device's cache file still holds the text
+# (another process's open read snapshot). Wording ruled by LabDirector fed79d00 R3.
+PENDING_CLEANUP_NOTE = (
+    "Atlaso will no longer recall or export this memory. Its text may still be in "
+    "this device's cache; Atlaso will retry cleanup when the cache is next opened or "
+    "synced. No action is needed from you."
+)
+# The forget scope disclosure, in its three approved sentences (fed79d00 R2/R3).
+# Without the recall and in-flight sentences a forget result overstates the
+# guarantee: an Ambient response already loading when the forget landed can still
+# carry the text (fence: rung 56c93359, DEBT-FS-13). That applies whatever the
+# cache cleanup outcome, so every successful forget that reports cleanup carries
+# it (DEBT-FS-23, LabDirector d630cbea).
+FORGET_RECALL_SCOPE = (
+    "Atlaso stops recalling and exporting a forgotten memory through its memory "
+    "tools."
+)
+FORGET_CACHE_MAY_LAG = "Cleanup of this device's cache may finish later."
+FORGET_INFLIGHT_DISCLOSURE = (
+    "If Atlaso context was loading when you forgot, the response may still contain "
+    "it and may be reused in new sessions for up to 15 minutes after it finishes "
+    "loading."
+)
+# Pending: the cache sentence is true, so all three sentences are shown.
+FORGET_SCOPE_DISCLOSURE = " ".join(
+    (FORGET_RECALL_SCOPE, FORGET_CACHE_MAY_LAG, FORGET_INFLIGHT_DISCLOSURE))
+# Done: the cache is already clean, so the cache sentence would be false; the
+# recall and in-flight sentences are shown unchanged.
+DONE_CLEANUP_NOTE = FORGET_RECALL_SCOPE + " " + FORGET_INFLIGHT_DISCLOSURE
+
+
 def do_forget(client, id: str) -> dict[str, Any]:
-    ok = client.forget(id)
-    if ok:
-        return {"forgotten": True, "id": id}
+    detail = getattr(client, "forget_detail", None)
+    res = detail(id) if callable(detail) else {"forgotten": client.forget(id)}
+    if res.get("forgotten"):
+        out: dict[str, Any] = {"forgotten": True, "id": id}
+        if res.get("local_cache_cleanup") in ("done", "pending"):
+            out["local_cache_cleanup"] = res["local_cache_cleanup"]
+        if res.get("local_cache_cleanup") == "pending":
+            out["note"] = PENDING_CLEANUP_NOTE + " " + FORGET_SCOPE_DISCLOSURE
+        elif res.get("local_cache_cleanup") == "done":
+            out["note"] = DONE_CLEANUP_NOTE
+        return out
     return {
         "forgotten": False,
         "id": id,

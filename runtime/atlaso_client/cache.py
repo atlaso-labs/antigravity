@@ -11,7 +11,54 @@ Tables:
   cached_deposits  — mirror of server deposits (+ optimistic local rows, pending=1)
   cached_fts       — FTS5 keyword index over content (offline recall)
   outbox           — local writes awaiting push to the server
-  cache_meta       — sync cursor (last server `seq` we've pulled)
+  cache_meta       — sync cursors (deposit, tombstone, change stream)
+  forgotten        — ids the user forgot (here or on another device); a pulled
+                     row with one of these ids is never stored again
+
+FORGET STICKS. A forgotten memory must never come back into this cache, whatever
+order the server pages arrive in and whatever cursor state the cache is in:
+  * remove() records the id in `forgotten` in the same transaction as the delete;
+  * upsert_deposit() refuses a forgotten id, and never stores a retracted row's
+    text (it prunes the row instead);
+  * the three sync cursors are reset only together, in one transaction, through
+    reset_sync_cursors(), which fails closed. Any future repair or resync command
+    must use it; resetting one cursor alone is the defect this rule exists for.
+
+FORGOTTEN TEXT LEAVES THE FILE. A plain DELETE only unlinks a row: its bytes stay
+in free pages, in FTS5 index segments (FTS5 deletes lazily, by delete-key) and in
+WAL frames, where `strings cache.db` still finds them. So:
+  * the connection runs PRAGMA secure_delete=ON (freed pages are zeroed) and
+    temp_store=MEMORY (a VACUUM's scratch copy never touches disk);
+  * TWO MONOTONIC COUNTERS in cache_meta record what is owed. `deleted_gen` is
+    raised in the SAME transaction as every delete of memory text; `scrubbed_gen`
+    is raised only by a completed scrub. A scrub is owed iff
+    deleted_gen > scrubbed_gen. Nothing ever deletes a marker, so no process can
+    erase another process's deletion (no ABA);
+  * scrub(): (1) in ONE write transaction read g = deleted_gen and run FTS5
+    'optimize' (drops the lazily deleted entries); (2) wal_checkpoint(TRUNCATE),
+    stopping if a reader keeps it busy; (3) only then scrubbed_gen =
+    max(scrubbed_gen, g). A delete committed after (1) carries a higher
+    generation and stays owed; a crash anywhere leaves it owed;
+  * a cache file written by an older client is upgraded once: its retracted rows
+    are deleted (raising deleted_gen), then optimize + VACUUM (text those clients
+    deleted without secure_delete sits in free pages) + TRUNCATE. Its done marker
+    is written only after the TRUNCATE succeeded.
+MAINTENANCE NEVER BLOCKS A HOT PATH. Everything above that runs on open (and the
+scope-column migration) runs with SQLite's busy handler off (busy_timeout 0): a lock
+error is retried in Python against a real-clock limit of 100 ms per statement, all
+inside ONE total deadline (OPEN_MAINTENANCE_S), with a progress handler that
+interrupts a statement past the deadline. busy_timeout bounds planned sleep, not
+wall time; in a timer-throttled process wall time can exceed it by more than 10x,
+so maintenance is bounded by a real-clock deadline instead. Busy, locked or out of
+time means deferred, never lost: the counters still say what is owed, and the
+next open, forget or sync (the 30 s background path, which also runs the VACUUM
+of a large legacy file) finishes it. Ordinary user-path writes keep the normal
+5 s busy timeout: correctness wins there.
+The FTS5 'secure-delete' table option is deliberately NOT used: once a row is
+deleted with it set, FTS5 older than SQLite 3.42 can no longer read or write the
+table ("invalid fts5 file format"), and every connector runtime on a machine
+shares this one file, each on its own SQLite build. 'optimize' reaches the same
+bytes on every version.
 """
 from __future__ import annotations
 
@@ -19,8 +66,11 @@ import json
 import re
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+from . import _telemetry
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cached_deposits (
@@ -96,6 +146,15 @@ CREATE TABLE IF NOT EXISTS superseded (
     id     TEXT PRIMARY KEY,
     by_id  TEXT NOT NULL,
     at     TEXT NOT NULL
+);
+
+-- Durable forget filter: ids forgotten on this device or learned from a server
+-- tombstone. Survives every cursor reset, so a replayed deposit page can never
+-- bring a forgotten memory back (a tombstoned id is never live again on the
+-- server: re-remembering the same text mints a new id).
+CREATE TABLE IF NOT EXISTS forgotten (
+    id  TEXT PRIMARY KEY,
+    at  TEXT NOT NULL
 );
 """
 
@@ -189,16 +248,37 @@ def _day_of_iso(created_at: str | None) -> str:
 _ATTEMPT_REASONS = ("signal", "substantive")
 
 
+# Maintenance limits. Every open is treated as the smallest opener on any tool
+# (claude-code and codex SessionStart: 3.0 s internal budget, start.py hook_budget;
+# 5 s host fuse, hooks.json), so maintenance on open gets a small slice of it.
+OPEN_MAINTENANCE_S = 0.5      # total deadline for ALL maintenance in one open
+LONG_MAINTENANCE_S = 30.0     # the background sync path and forget's scrub cap
+SWEEP_INLINE_BYTES = 1 << 20  # a legacy file this small is upgraded on any open
+_MAINT_BUSY_MS = 100          # real-clock lock-retry limit per maintenance statement
+_RETRY_SLEEP_S = 0.01         # between lock retries under maintenance
+_USER_BUSY_MS = 5000          # busy timeout for user-path writes (sqlite3 default)
+_PROGRESS_STEPS = 1000        # VM steps between deadline checks
+
+
 class Cache:
     """Plain SQLite cache. Single-threaded use per instance (open one per process /
     per hook invocation). All writes commit immediately — the cache is small."""
 
+    _maint_deadline: float | None = None  # set only inside _maintenance_limits
+    _deferred_for_size = False            # set by the upgrade on a short open
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path))
+        # timeout = the USER-path busy timeout (capture enqueue, sync writes);
+        # maintenance sets it to 0 for its own statements only and restores it
+        self._conn = sqlite3.connect(str(self.path), timeout=_USER_BUSY_MS / 1000)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # per connection: zero freed pages, so deleted memory text is overwritten,
+        # and keep a VACUUM's temporary copy of the file in memory
+        self._conn.execute("PRAGMA secure_delete=ON")
+        self._conn.execute("PRAGMA temp_store=MEMORY")
         self._conn.executescript(_SCHEMA)
         for mig in _MIGRATIONS:
             try:
@@ -206,7 +286,239 @@ class Cache:
             except sqlite3.OperationalError:
                 pass  # already migrated (duplicate column) — expected
         self._conn.commit()
-        self._scope_key_ready = self._ensure_scope_columns()
+        self._scope_key_ready = False
+        # every open is treated as the SMALLEST opener (SessionStart: 3 s internal
+        # budget, 5 s host fuse): bounded maintenance only, the rest deferred
+        self.maintain(OPEN_MAINTENANCE_S)
+
+    # ── maintenance: bounded, deferrable, never blocks a hot path ────────────
+    def maintain(self, seconds: float = OPEN_MAINTENANCE_S, *, long: bool = False) -> bool:
+        """Run the maintenance this file owes (scope-column migration, legacy
+        upgrade, scrub), all inside ONE deadline of `seconds`, each statement under a
+        real-clock lock-retry limit of _MAINT_BUSY_MS. `long` is the 30 s background
+        path (sync): only it runs the VACUUM of a legacy file larger than
+        SWEEP_INLINE_BYTES. Returns True when
+        nothing is owed afterwards. Busy, locked, read-only or out of time: returns
+        False and the owed work stays recorded (the counters), never raises."""
+        deadline = time.monotonic() + seconds
+        self._deferred_for_size = False
+        with self._maintenance_limits(deadline):
+            ready = self._guarded(self._ensure_scope_columns)
+            self._scope_key_ready = bool(ready)
+            upgraded = self._guarded(lambda: self._upgrade_legacy(long=long))
+            if self._deferred_for_size:
+                # the long path's upgrade optimizes the whole index anyway: do not
+                # spend this short open on an optimize of a large legacy file
+                return False
+            scrubbed = self._guarded(self._scrub)
+        return bool(upgraded) and bool(scrubbed)
+
+    def _guarded(self, step: Any) -> Any:
+        """One maintenance step: a busy/locked/interrupted/read-only error rolls
+        back and yields None (deferred); the counters keep what is owed."""
+        try:
+            return step()
+        except sqlite3.OperationalError:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            return None
+
+    @contextmanager
+    def _maintenance_limits(self, deadline: float) -> Iterator[None]:
+        """Run the statements inside with NO SQLite busy wait (lock waits are
+        retried in Python for at most _MAINT_BUSY_MS each, see _write_txn and
+        _checkpoint) and a hard deadline (progress handler interrupts a statement
+        past it); the user-path busy timeout is restored after, on every exit.
+        SQLite's own busy handler is not used here. busy_timeout bounds planned
+        sleep, not wall time. In a timer-throttled process, wall time can exceed it
+        by more than 10x. Bound maintenance with a real-clock deadline. (SQLite
+        3.47.1, one machine, 2026-09-26: busy_timeout=100 cost 1.34-1.39 s per
+        statement in a background-priority process, 0.12-0.13 s in an interactive
+        one; research/artifacts/forget-sticks-r4/attribution_cell.py.) A
+        time.monotonic() limit overshoots by at most one stretched sleep."""
+        self._conn.execute("PRAGMA busy_timeout = 0")
+        self._conn.set_progress_handler(
+            lambda: 1 if time.monotonic() > deadline else 0, _PROGRESS_STEPS)
+        self._maint_deadline = deadline
+        try:
+            yield
+        finally:
+            self._maint_deadline = None
+            self._conn.set_progress_handler(None, 0)
+            try:
+                self._conn.execute(f"PRAGMA busy_timeout = {_USER_BUSY_MS}")
+            except sqlite3.Error:
+                pass
+
+    def _retry_busy(self, attempt: Any) -> Any:
+        """Call attempt() until it stops failing with a lock error, for at most
+        _MAINT_BUSY_MS and never past the maintenance deadline; the last error
+        is raised."""
+        deadline = self._maint_deadline
+        stop = time.monotonic() + _MAINT_BUSY_MS / 1000
+        if deadline is not None:
+            stop = min(stop, deadline)
+        while True:
+            try:
+                return attempt()
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e) and "busy" not in str(e):
+                    raise
+                if deadline is None or time.monotonic() + _RETRY_SLEEP_S > stop:
+                    raise
+                time.sleep(_RETRY_SLEEP_S)
+
+    def _write_txn(self) -> None:
+        """BEGIN IMMEDIATE (take the write lock now, so reads inside it are the
+        state the write commits against); bounded retry under maintenance."""
+        if self._conn.in_transaction:
+            self._conn.commit()
+        self._retry_busy(lambda: self._conn.execute("BEGIN IMMEDIATE"))
+
+    def _checkpoint(self) -> bool:
+        """wal_checkpoint(TRUNCATE); True only when the WAL was fully written back
+        and truncated. Busy (a reader on an old snapshot, a writer) is retried for
+        at most _MAINT_BUSY_MS, then False."""
+        def attempt() -> bool:
+            if self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]:
+                raise sqlite3.OperationalError("checkpoint busy")
+            return True
+        try:
+            return bool(self._retry_busy(attempt))
+        except sqlite3.OperationalError as e:
+            if "busy" in str(e) or "locked" in str(e):
+                return False
+            raise
+
+    # ── the two counters ─────────────────────────────────────────────────────
+    _DELETED_GEN = "deleted_gen"
+    _SCRUBBED_GEN = "scrubbed_gen"
+    _LEGACY_PENDING_KEY = "scrub_pending"  # ef045bfbe's deletable marker (lab only)
+
+    def _gen(self, key: str) -> int:
+        v = self.get_meta(key)
+        try:
+            return int(v) if v is not None else 0
+        except ValueError:
+            return 0
+
+    def _note_deleted(self) -> None:
+        """Raise deleted_gen inside the CALLER'S transaction (no commit). Every
+        delete of memory text calls this in the same transaction as the delete."""
+        self._conn.execute(
+            "INSERT INTO cache_meta(k, v) VALUES(?, '1') ON CONFLICT(k) DO UPDATE "
+            "SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT)", (self._DELETED_GEN,))
+
+    def _raise_scrubbed(self, g: int, *, done_marker: str | None = None) -> None:
+        """scrubbed_gen = max(scrubbed_gen, g) in its own transaction (with the
+        upgrade's done marker, when given); max() makes concurrent scrubbers safe
+        in any order."""
+        self._write_txn()
+        if done_marker:
+            self._set_meta_in_txn(done_marker, _now_iso())
+        self._conn.execute(
+            "INSERT INTO cache_meta(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE "
+            "SET v = CAST(max(CAST(v AS INTEGER), CAST(excluded.v AS INTEGER)) AS TEXT)",
+            (self._SCRUBBED_GEN, str(int(g))))
+        self._conn.commit()
+
+    def _scrub_owed(self) -> bool:
+        """deleted_gen > scrubbed_gen (or ef045bfbe's marker is still present)."""
+        return (self._gen(self._DELETED_GEN) > self._gen(self._SCRUBBED_GEN)
+                or self.get_meta(self._LEGACY_PENDING_KEY) is not None)
+
+    def scrub_pending(self) -> bool:
+        """True while deleted memory text may still be in the file's bytes: a
+        scrub is owed, or the one-time upgrade of an older client's file (its
+        VACUUM) has not completed."""
+        return self._scrub_owed() or self.get_meta(self._UPGRADED_KEY) is None
+
+    def deleted_generation(self) -> int:
+        """How many text deletes this file has recorded (monotonic)."""
+        return self._gen(self._DELETED_GEN)
+
+    # ── scrub: forgotten text leaves the file ────────────────────────────────
+    def scrub(self, seconds: float = LONG_MAINTENANCE_S) -> bool:
+        """Remove deleted memory text from the file's bytes, within `seconds`.
+        True when nothing is owed afterwards; False when a reader kept the WAL from
+        truncating, the file was locked or time ran out (still owed: the next
+        forget, sync or open retries). A no-op read when nothing is owed. Never
+        raises for a locked or read-only file."""
+        deadline = time.monotonic() + seconds
+        with self._maintenance_limits(deadline):
+            return bool(self._guarded(self._scrub))
+
+    def _scrub(self) -> bool:
+        if not self._scrub_owed():
+            return not self.scrub_pending()
+        # (1) read the owed generation and optimize in ONE write transaction: every
+        # delete counted in g committed before this optimize ran
+        self._write_txn()
+        if self._conn.execute("DELETE FROM cache_meta WHERE k = ?",
+                              (self._LEGACY_PENDING_KEY,)).rowcount:
+            self._note_deleted()  # the old marker becomes a generation, atomically
+        g = self._gen(self._DELETED_GEN)
+        self._conn.execute("INSERT INTO cached_fts(cached_fts) VALUES('optimize')")
+        self._conn.commit()
+        # (2) every WAL frame that held the text goes; a reader keeps it busy
+        if not self._checkpoint():
+            return False
+        # (3) only now is g scrubbed
+        self._raise_scrubbed(g)
+        return not self.scrub_pending()
+
+    # ── one-time upgrade of a file written by an older client ────────────────
+    # _ROWS_KEY: retracted rows deleted and their residue recorded as owed.
+    # _UPGRADED_KEY: optimize + VACUUM + TRUNCATE completed. The v2 marker written
+    # by ef045bfbe (before its checkpoint result was known) is not trusted.
+    _ROWS_KEY = "legacy_rows_swept_v3"
+    _UPGRADED_KEY = "legacy_vacuumed_v3"
+    _SWEPT_KEY = _UPGRADED_KEY
+
+    def _upgrade_legacy(self, *, long: bool) -> bool:
+        """Older clients kept a retracted row's TEXT behind a flag, and deleted
+        forgotten rows without secure_delete (text in free pages, FTS5 segments and
+        WAL frames). (a) Delete the retracted rows and raise deleted_gen, in one
+        transaction, so the ordinary scrub owes their residue. (b) Estimate the
+        VACUUM from page_count; a short opener defers a file larger than
+        SWEEP_INLINE_BYTES to the long (sync) path. (c) optimize (reading g in the
+        same transaction), VACUUM, TRUNCATE; only after the TRUNCATE succeeded write
+        the done marker and scrubbed_gen = max(scrubbed_gen, g). True when done."""
+        if self.get_meta(self._UPGRADED_KEY) is not None:
+            return True
+        if self.get_meta(self._ROWS_KEY) is None:
+            self._write_txn()
+            self._conn.execute(
+                "DELETE FROM cached_fts WHERE deposit_id IN "
+                "(SELECT id FROM cached_deposits WHERE retracted != 0)")
+            self._conn.execute("DELETE FROM cached_deposits WHERE retracted != 0")
+            self._note_deleted()  # residue of older clients' deletes is owed
+            self._set_meta_in_txn(self._ROWS_KEY, _now_iso())
+            self._conn.commit()
+        size = (self._conn.execute("PRAGMA page_count").fetchone()[0]
+                * self._conn.execute("PRAGMA page_size").fetchone()[0])
+        if not long and size > SWEEP_INLINE_BYTES:
+            _telemetry.log("cache", "legacy_upgrade_deferred", bytes=size)
+            self._deferred_for_size = True
+            return False
+        started = time.monotonic()
+        self._write_txn()
+        g = self._gen(self._DELETED_GEN)
+        self._conn.execute("INSERT INTO cached_fts(cached_fts) VALUES('optimize')")
+        self._conn.commit()
+        self._retry_busy(lambda: self._conn.execute("VACUUM"))
+        if not self._checkpoint():
+            _telemetry.log("cache", "legacy_upgrade_busy", bytes=size)
+            return False
+        self._raise_scrubbed(g, done_marker=self._UPGRADED_KEY)
+        _telemetry.log("cache", "legacy_upgrade_done", bytes=size,
+                       ms=int((time.monotonic() - started) * 1000))
+        return True
+
+    def _set_meta_in_txn(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT INTO cache_meta(k, v) VALUES(?, ?) "
+            "ON CONFLICT(k) DO UPDATE SET v = excluded.v", (key, value))
 
     def _ensure_scope_columns(self) -> bool:
         """Make the cache ready for the scoped near-dup search. On a cache already
@@ -219,7 +531,7 @@ class Cache:
         if not stale_triggers and all(c in cols for c in _SCOPE_COLUMNS):
             return True
         try:
-            self._conn.execute("BEGIN IMMEDIATE")
+            self._write_txn()
             for name in _WITHDRAWN_TRIGGERS:
                 self._conn.execute(f"DROP TRIGGER IF EXISTS {name}")
             cols = self._columns()
@@ -274,7 +586,9 @@ class Cache:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    # ── sync cursor ──────────────────────────────────────────────────────────
+    # ── sync cursors ─────────────────────────────────────────────────────────
+    _CURSOR_KEYS = ("last_seq", "last_tomb_seq", "last_changes_seq")
+
     def get_cursor(self) -> int:
         r = self._conn.execute("SELECT v FROM cache_meta WHERE k = 'last_seq'").fetchone()
         return int(r["v"]) if r else 0
@@ -298,6 +612,35 @@ class Cache:
             (str(int(seq)),),
         )
         self._conn.commit()
+
+    def advance_cursors(self, *, deposit: int, tomb: int, changes: int) -> None:
+        """Store all three sync cursors in ONE transaction (a pull page's cursors
+        move together or not at all)."""
+        with self._conn:
+            self._conn.executemany(
+                "INSERT INTO cache_meta(k, v) VALUES(?, ?) "
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                [(k, str(int(v))) for k, v in zip(self._CURSOR_KEYS, (deposit, tomb, changes))])
+
+    def reset_sync_cursors(self) -> None:
+        """The ONLY sanctioned way to make the next pull replay from the start: the
+        deposit, tombstone and change-stream cursors go back to 0 together, in one
+        write transaction. Fails closed: if the transaction cannot be taken or
+        committed (locked or read-only file) it raises and no cursor moves. The
+        `forgotten` filter is kept, so the replay cannot resurrect a forget."""
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.executemany("DELETE FROM cache_meta WHERE k = ?",
+                                   [(k,) for k in self._CURSOR_KEYS])
+            self._conn.commit()
+        except sqlite3.Error:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+
+    def is_forgotten(self, deposit_id: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM forgotten WHERE id = ?", (deposit_id,)).fetchone() is not None
 
     def get_meta(self, key: str) -> str | None:
         """Generic cache_meta read (one-shot markers, e.g. the junk-project
@@ -329,13 +672,12 @@ class Cache:
         self._conn.commit()
 
     # ── FTS index helper ─────────────────────────────────────────────────────
-    def _index_fts(self, deposit_id: str, content: str, *, retracted: bool = False) -> None:
+    def _index_fts(self, deposit_id: str, content: str) -> None:
         self._conn.execute("DELETE FROM cached_fts WHERE deposit_id = ?", (deposit_id,))
-        if not retracted:
-            self._conn.execute(
-                "INSERT INTO cached_fts(deposit_id, content) VALUES(?, ?)",
-                (deposit_id, content),
-            )
+        self._conn.execute(
+            "INSERT INTO cached_fts(deposit_id, content) VALUES(?, ?)",
+            (deposit_id, content),
+        )
 
     def _scope_write(self, tags_json: str) -> tuple[str, str, str, tuple[str, ...]]:
         """SQL fragments + values that key a row being written with `tags_json`:
@@ -360,7 +702,14 @@ class Cache:
         created_at: str | None = None,
         tags: list[str] | None = None,
         retracted: bool = False,
-    ) -> None:
+    ) -> bool:
+        """Mirror one server row. Returns False when the row was NOT stored: its id
+        is forgotten (never stored again), or it is retracted (its text is pruned
+        from the cache instead of being kept behind a flag)."""
+        if retracted or self.is_forgotten(id):
+            self._prune(id)
+            self._conn.commit()
+            return False
         tags_json = json.dumps(tags or [])
         cols, marks, sets, extra = self._scope_write(tags_json)
         self._conn.execute(
@@ -372,10 +721,19 @@ class Cache:
             "scope_note=excluded.scope_note, created_at=excluded.created_at, "
             "tags_json=excluded.tags_json, retracted=excluded.retracted, pending=0" + sets,
             (id, seq, content, polarity, evidence_grade, scope_note, created_at,
-             tags_json, 1 if retracted else 0, *extra),
+             tags_json, 0, *extra),
         )
-        self._index_fts(id, content, retracted=retracted)
+        self._index_fts(id, content)
         self._conn.commit()
+        return True
+
+    def _prune(self, deposit_id: str) -> None:
+        """Delete a row and its keyword index entry and, when anything was deleted,
+        raise deleted_gen in the same transaction (no commit)."""
+        n = self._conn.execute("DELETE FROM cached_deposits WHERE id = ?", (deposit_id,)).rowcount
+        n += self._conn.execute("DELETE FROM cached_fts WHERE deposit_id = ?", (deposit_id,)).rowcount
+        if n:
+            self._note_deleted()
 
     # ── local write (remember) → cache + outbox ──────────────────────────────
     def enqueue(
@@ -489,6 +847,13 @@ class Cache:
         if dropped:
             self._conn.execute("DELETE FROM cached_deposits WHERE id = ?", (client_id,))
             self._conn.execute("DELETE FROM cached_fts WHERE deposit_id = ?", (client_id,))
+            self._conn.commit()
+            return
+
+        if server_id and self.is_forgotten(server_id):
+            # the server settled this write onto a memory the user forgot: never
+            # rekey a live local row onto a forgotten id
+            self._prune(client_id)
             self._conn.commit()
             return
 
@@ -652,12 +1017,21 @@ class Cache:
         return out
 
     def remove(self, deposit_id: str) -> None:
-        """Drop a memory from the cache + outbox + quarantine (used by forget)."""
-        self._conn.execute("DELETE FROM cached_deposits WHERE id = ?", (deposit_id,))
-        self._conn.execute("DELETE FROM cached_fts WHERE deposit_id = ?", (deposit_id,))
-        self._conn.execute("DELETE FROM outbox WHERE client_id = ?", (deposit_id,))
-        self._conn.execute("DELETE FROM quarantine WHERE client_id = ?", (deposit_id,))
-        self._conn.commit()
+        """Forget a memory locally: drop it from the cache + outbox + quarantine and
+        record the id in `forgotten`, all in one transaction (used by forget and by
+        server tombstones). A text delete raises deleted_gen in the same
+        transaction; the caller runs scrub() afterwards (Client.forget and the end
+        of every pull do), and an owed scrub also runs on the next open."""
+        with self._conn:
+            self._prune(deposit_id)
+            n = self._conn.execute("DELETE FROM outbox WHERE client_id = ?",
+                                   (deposit_id,)).rowcount
+            n += self._conn.execute("DELETE FROM quarantine WHERE client_id = ?",
+                                    (deposit_id,)).rowcount
+            if n:
+                self._note_deleted()
+            self._conn.execute("INSERT OR IGNORE INTO forgotten(id, at) VALUES(?, ?)",
+                               (deposit_id, _now_iso()))
 
     # ── introspection (for connectors / status / debugging) ──────────────────
     def counts(self) -> dict:

@@ -31,7 +31,8 @@ INSTRUCTIONS = (
     "(e.g. the user references something earlier, or asks 'what did we decide about X').\n"
     "- remember: save a specific durable fact, decision, preference, or gotcha worth "
     "keeping for next time.\n"
-    "- forget: delete a memory by id (ids come from recall/recent). Only when asked.\n"
+    "- forget: Removes it from your memory everywhere Atlaso recalls or exports it. "
+    "Takes a memory id (ids come from recall/recent). You can't undo it. Only when asked.\n"
     "- recent: list the latest memories.\n"
     "- status: memory health (FMI) + counts.\n"
     "- ambient: Ambient Memory — load the user's saved context for this project before you start (once per conversation).\n"
@@ -115,9 +116,10 @@ def remember(
 
 @mcp.tool()
 def forget(id: str) -> dict:
-    """Permanently delete a memory by its id (get ids from recall/recent).
+    """Forget a memory by its id (get ids from recall/recent).
 
-    Destructive and not undoable — use only when the user asks to forget something.
+    Removes it from your memory everywhere Atlaso recalls or exports it.
+    Use only when the user asks to forget something.
     """
     out = tools.do_forget(client(), id)
     attest.note_tool_call()

@@ -3,6 +3,9 @@
 Snapshots are for inspection/background refresh. SessionStart always validates
 online so disabling Ambient affects the next session, even with a fresh cache.
 Account/credential identity, tool, project and TTL isolate each atomic record.
+
+A snapshot is a copy of recalled memory text, so a forget deletes every snapshot
+file (purge): they are inspection-only and rebuilt by the next sync's refresh.
 """
 from __future__ import annotations
 
@@ -20,11 +23,15 @@ from . import config
 TTL = int(os.environ.get("ATLASO_AMBIENT_TTL", "900"))  # 15 min
 
 
+def _dir() -> Path:
+    return config.atlaso_dir() / "ambient-v1"
+
+
 def _path(tool: Optional[str], project: Optional[str] = None) -> Path:
     # Versioned namespace: old account-wide records are never candidates for a
     # scoped brief. Hash both inputs so keys cannot become filesystem paths.
     key = hashlib.sha256(json.dumps([tool, project]).encode()).hexdigest()
-    return config.atlaso_dir() / "ambient-v1" / f"{key}.json"
+    return _dir() / f"{key}.json"
 
 
 def load(tool: Optional[str], identity: str, ttl: int = TTL,
@@ -63,3 +70,24 @@ def save(tool: Optional[str], identity: str, block: Optional[str],
                 pass
     except OSError:
         pass
+
+
+def purge() -> int:
+    """Delete every snapshot file (and any temp file a writer left behind) for
+    every tool, project and identity on this machine. Called on a forget: a
+    snapshot records no memory ids, and another tool's snapshot of the same
+    account can hold the same text. Returns how many files were deleted; never
+    raises."""
+    n = 0
+    try:
+        entries = list(_dir().iterdir())
+    except OSError:
+        return 0
+    for p in entries:
+        if p.suffix in (".json", ".tmp") and p.is_file():
+            try:
+                p.unlink()
+                n += 1
+            except OSError:
+                pass
+    return n
