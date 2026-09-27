@@ -229,6 +229,17 @@ def near_kind(new: str, existing: str, jaccard: float = 0.85,
     return "duplicate"
 
 
+# How capture joins the assistant's reply onto the user's text (Client.capture).
+ASSISTANT_MARK = "\n\n(assistant: "
+
+
+def user_span_of(content: str) -> str:
+    """The USER-authored part of a stored capture: the text before the appended
+    "(assistant: ...)" reply. A note without one (a manual note, an L2 rewrite) is
+    all user-facing text and is returned whole."""
+    return (content or "").split(ASSISTANT_MARK, 1)[0]
+
+
 def near_dup(new: str, existing: str, jaccard: float = 0.85, containment: float = 0.95) -> bool:
     """True when `new` adds nothing over `existing` (so skip it): bag-similar AND no new
     content word AND no new direction pair. A substituted value or a mirrored change is

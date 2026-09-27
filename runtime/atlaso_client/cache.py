@@ -156,6 +156,17 @@ CREATE TABLE IF NOT EXISTS forgotten (
     id  TEXT PRIMARY KEY,
     at  TEXT NOT NULL
 );
+
+-- User re-assertions waiting to be pushed (rung 85bcf262 round 3): capture
+-- dropped a near-duplicate whose USER-authored text repeats the live memory
+-- `target_id` (its server id, or its outbox client_id until that is pushed).
+-- One row per target holding the LATEST repeat time; no content is stored.
+CREATE TABLE IF NOT EXISTS reassert_outbox (
+    target_id    TEXT PRIMARY KEY,
+    tags_json    TEXT NOT NULL DEFAULT '[]',
+    asserted_at  TEXT NOT NULL,
+    attempts     INTEGER NOT NULL DEFAULT 0
+);
 """
 
 # Additive column migrations for caches created by older clients. Applied
@@ -845,6 +856,8 @@ class Cache:
         """
         self._conn.execute("DELETE FROM outbox WHERE client_id = ?", (client_id,))
         if dropped:
+            # a refused memory cannot be re-asserted: forget any queued repeat of it
+            self._conn.execute("DELETE FROM reassert_outbox WHERE target_id = ?", (client_id,))
             self._conn.execute("DELETE FROM cached_deposits WHERE id = ?", (client_id,))
             self._conn.execute("DELETE FROM cached_fts WHERE deposit_id = ?", (client_id,))
             self._conn.commit()
@@ -863,6 +876,18 @@ class Cache:
                                (server_id, client_id))
             self._conn.execute("UPDATE superseded SET by_id = ? WHERE by_id = ?",
                                (server_id, client_id))
+            # a queued repeat of this memory now names its server id (the later
+            # time wins if that id somehow has a queued repeat already)
+            for r in self._conn.execute(
+                    "SELECT tags_json, asserted_at FROM reassert_outbox WHERE target_id = ?",
+                    (client_id,)).fetchall():
+                self._conn.execute("DELETE FROM reassert_outbox WHERE target_id = ?", (client_id,))
+                self._conn.execute(
+                    "INSERT INTO reassert_outbox(target_id, tags_json, asserted_at, attempts) "
+                    "VALUES(?,?,?,0) ON CONFLICT(target_id) DO UPDATE SET "
+                    "tags_json = excluded.tags_json, asserted_at = excluded.asserted_at, attempts = 0 "
+                    "WHERE excluded.asserted_at > reassert_outbox.asserted_at",
+                    (server_id, r["tags_json"], r["asserted_at"]))
             exists = self._conn.execute(
                 "SELECT 1 FROM cached_deposits WHERE id = ?", (server_id,)
             ).fetchone()
@@ -972,6 +997,47 @@ class Cache:
             "INSERT INTO superseded(id, by_id, at) VALUES(?,?,?) "
             "ON CONFLICT(id) DO UPDATE SET by_id = excluded.by_id, at = excluded.at",
             (old_id, by_id, _now_iso()))
+        self._conn.commit()
+
+    # ── user re-assertions (rung 85bcf262 round 3, standing memo item 30) ─────
+    def queue_reassert(self, target_id: str, tags: list[str], asserted_at: str | None = None) -> None:
+        """Queue "the user repeated live memory `target_id` at `asserted_at`" for the
+        next push. Keeps only the LATEST time per target (a later repeat replaces an
+        earlier one, an earlier one never replaces a later one) and resets its
+        attempt count. Content-free."""
+        when = asserted_at or _now_iso()
+        self._conn.execute(
+            "INSERT INTO reassert_outbox(target_id, tags_json, asserted_at, attempts) VALUES(?,?,?,0) "
+            "ON CONFLICT(target_id) DO UPDATE SET tags_json = excluded.tags_json, "
+            "asserted_at = excluded.asserted_at, attempts = 0 "
+            "WHERE excluded.asserted_at > reassert_outbox.asserted_at",
+            (target_id, json.dumps(tags or []), when))
+        self._conn.commit()
+
+    def list_reasserts(self, limit: int = 100) -> list[dict]:
+        """Queued re-assertions whose target is on the server (not an unpushed
+        outbox item), oldest first."""
+        rows = self._conn.execute(
+            "SELECT target_id, tags_json, asserted_at, attempts FROM reassert_outbox r "
+            "WHERE NOT EXISTS (SELECT 1 FROM outbox o WHERE o.client_id = r.target_id) "
+            "ORDER BY asserted_at LIMIT ?", (limit,)).fetchall()
+        return [{"target_id": r["target_id"], "tags": _row_tags(r["tags_json"]),
+                 "asserted_at": r["asserted_at"], "attempts": r["attempts"]} for r in rows]
+
+    def resolve_reassert(self, target_id: str, asserted_at: str) -> None:
+        """The server settled the repeat sent at `asserted_at`: remove it, unless a
+        later repeat was queued meanwhile (that one is still owed)."""
+        self._conn.execute("DELETE FROM reassert_outbox WHERE target_id = ? AND asserted_at <= ?",
+                           (target_id, asserted_at))
+        self._conn.commit()
+
+    def bump_reassert(self, target_id: str, max_attempts: int) -> None:
+        """Count a failed delivery; give the repeat up after `max_attempts` (it only
+        refreshes a date, and an old brain that ignores it would keep it forever)."""
+        self._conn.execute("UPDATE reassert_outbox SET attempts = attempts + 1 WHERE target_id = ?",
+                           (target_id,))
+        self._conn.execute("DELETE FROM reassert_outbox WHERE target_id = ? AND attempts >= ?",
+                           (target_id, max_attempts))
         self._conn.commit()
 
     def content_of(self, deposit_id: str) -> str | None:

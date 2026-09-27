@@ -308,10 +308,11 @@ class Client:
             if not ok:
                 return {"saved": False, "reason": reason}
             content = _capture.scrub(user_text)[0]
+            user_span = content  # the USER-authored text of this capture (memo item 30)
             if assistant_text:
                 a = _capture.scrub(assistant_text)[0].strip()
                 if a:
-                    content += f"\n\n(assistant: {a[:400]})"
+                    content += f"{_capture.ASSISTANT_MARK}{a[:400]})"
             scope = _capture.classify_scope(user_text)
             pol = _capture.heuristic_polarity(user_text)
             tags = [source_tag or self.tool or "atlaso", "auto",
@@ -352,6 +353,8 @@ class Client:
             # near-dup vs the local commodity cache (offline-safe; no server call)
             related = self._near_dup_route(content, tags, scope, proj)
             if related.get("duplicate"):
+                # the user repeated a live memory: re-date it (return shape unchanged)
+                self._queue_reassert(related, user_span, tags)
                 return {"saved": False, "reason": "near_dup"}
             # Capture polarity (Week-1 Step 4): default "open" (legacy). With
             # ATLASO_CAPTURE_PENDING=1, auto-captures land as "pending" — the
@@ -368,6 +371,23 @@ class Client:
                     **_route_hints(related)}
         except Exception:
             return {"saved": False, "reason": "error"}
+
+    def _queue_reassert(self, related: dict[str, Any], user_span: str, tags: list[str]) -> bool:
+        """The dropped capture repeats a live memory. Queue a re-assertion (the brain
+        re-dates that memory to now, standing memo item 30) ONLY when the USER-authored
+        text on its own repeats the memory's user-authored text: an assistant echo of
+        an injected memory is never the user saying it again. Never raises."""
+        from . import _capture
+        try:
+            twin = related.get("duplicate_content")
+            if not isinstance(twin, str):
+                return False
+            if _capture.near_kind(user_span, _capture.user_span_of(twin)) != "duplicate":
+                return False
+            self.cache.queue_reassert(related["duplicate"], tags)
+            return True
+        except Exception:  # noqa: BLE001 - a re-assertion must never break a capture
+            return False
 
     def _near_dup_route(self, content: str, tags: list[str], scope: str,
                         proj: str | None) -> dict[str, Any]:
@@ -401,7 +421,7 @@ class Client:
         for e in bucket(False):
             kind = _capture.near_kind(content, e.get("content") or "")
             if kind == "duplicate":
-                return {"duplicate": e["id"]}
+                return {"duplicate": e["id"], "duplicate_content": e.get("content") or ""}
             if kind == "update" and "update_of" not in out:
                 out["update_of"] = e["id"]
         for h in bucket(True):
@@ -452,7 +472,10 @@ class Client:
             # repo B (Codex BLOCKER).
             from . import _project
             raw = self.cache.keyword_search(query, max(limit * 4, limit))
-            results = [r for r in raw
+            # No created_at offline: the cache holds the server row's INSERTION
+            # time, which for an L2 rewrite is not when the note was said, so the
+            # renderer must show these lines undated (rung 85bcf262 repair).
+            results = [{k: v for k, v in r.items() if k != "created_at"} for r in raw
                        if _project.visible_in_project(r.get("tags") or [], project)][:limit]
         except Exception:
             results = []  # SQLite lock/corruption/pathological FTS → empty, never raise
@@ -714,6 +737,10 @@ class Client:
             "evidence_grade": it["evidence_grade"], "scope_note": it["scope_note"],
             "tags": it["tags"],
         }
+        # When the note was captured on this machine (outbox created_at, UTC), so a
+        # delayed push is dated by its capture, not by the server's receipt.
+        if isinstance(it.get("created_at"), str) and it["created_at"]:
+            p["captured_at"] = it["created_at"]
         if b64:
             # WAF fallback: the plain text pattern-matched an edge rule; base64
             # denies the lexical match (the server decodes; content unchanged).
@@ -802,13 +829,48 @@ class Client:
         except Exception:
             pass
 
-    def _deposit(self, payloads: list[dict], stats: list[dict] | None) -> dict:
-        """deposit_batch with capture_stats attached only when there's something to
-        send — so the wire shape (and any pre-field API double) is untouched when
-        there are no stats. Attaching stats must never alter item delivery."""
+    def _deposit(self, payloads: list[dict], stats: list[dict] | None,
+                 reasserts: list[dict] | None = None) -> dict:
+        """deposit_batch with capture_stats / reassertions attached only when there's
+        something to send — so the wire shape (and any pre-field API double) is
+        untouched without them. Attaching them must never alter item delivery."""
+        extra: dict[str, Any] = {}
         if stats is not None:
-            return self.api.deposit_batch(payloads, capture_stats=stats)
-        return self.api.deposit_batch(payloads)
+            extra["capture_stats"] = stats
+        if reasserts:
+            extra["reassertions"] = [
+                {"target_id": r["target_id"], "tags": r["tags"], "captured_at": r["asserted_at"]}
+                for r in reasserts]
+        return self.api.deposit_batch(payloads, **extra)
+
+    # A queued re-assertion is given up after this many deliveries the brain did
+    # not settle (an older brain ignores the field; the repeat only refreshes a date).
+    _REASSERT_MAX_ATTEMPTS = 5
+
+    def _list_reasserts(self) -> list[dict]:
+        try:
+            return self.cache.list_reasserts(limit=_PUSH_BATCH)
+        except Exception:  # noqa: BLE001 - a re-assertion must never block a push
+            return []
+
+    def _settle_reasserts(self, resp: dict, sent: list[dict]) -> None:
+        """Settle re-assertions from the brain's per-target verdicts. Any verdict but
+        "error" is final (refreshed, unchanged, or refused: missing, retracted,
+        superseded, scope, invalid). A reply without `reassertions` (an older brain)
+        or an "error" counts an attempt. Never raises."""
+        if not sent:
+            return
+        try:
+            verdicts = {v.get("target_id"): v.get("status")
+                        for v in (resp.get("reassertions") or []) if isinstance(v, dict)}
+            for r in sent:
+                status = verdicts.get(r["target_id"])
+                if status and status != "error":
+                    self.cache.resolve_reassert(r["target_id"], r["asserted_at"])
+                else:
+                    self.cache.bump_reassert(r["target_id"], self._REASSERT_MAX_ATTEMPTS)
+        except Exception:  # noqa: BLE001, S110 - settling is retried on the next push
+            pass
 
     def _push(self) -> dict:
         """Drain the outbox. Fast path: one batch deposit. If the BATCH request
@@ -822,25 +884,30 @@ class Client:
         the last send, a stats-only batch (items=[]) still goes out; when nothing
         changed and there's nothing to push, this is a no-op. Stats attachment can
         never wedge delivery: if the batch fails, the per-item fallback runs WITHOUT
-        stats and the counters simply retry next tick.
+        stats and the counters simply retry next tick. Queued user re-assertions
+        (memo item 30) ride on the batch the same way and are settled from its reply.
         Returns {client_id: server_id} for every settled item."""
         items = self.cache.list_outbox(limit=_PUSH_BATCH)
         stats = self._stats_payload()
-        if not items and not self._stats_dirty(stats):
+        reasserts = self._list_reasserts()
+        if not items and not reasserts and not self._stats_dirty(stats):
             return {}
         mapping: dict[str, str] = {}
         created = {it["client_id"]: it["created_at"] for it in items}
         try:
-            resp = self._deposit([self._item_payload(it) for it in items], stats)
+            resp = self._deposit([self._item_payload(it) for it in items], stats, reasserts)
         except (AuthRejected, NotEntitled):
             raise  # a verified app verdict — no point retrying per-item
         except Exception as e:
             _telemetry.log("push", "batch_failed", error=type(e).__name__,
                            status=getattr(e, "status", None),
                            cf_ray=getattr(e, "cf_ray", None), items=len(items))
+            # re-assertions ride only on the batch: count the attempt, retry next tick
+            self._settle_reasserts({}, reasserts)
             self._push_each(items, mapping, created)
             return mapping
         self._apply_results(resp, mapping, created)
+        self._settle_reasserts(resp, reasserts)
         self._mark_stats_sent(stats)
         _telemetry.log("push", "push_ok", items=len(items), settled=len(mapping))
         return mapping

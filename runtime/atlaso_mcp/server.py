@@ -86,7 +86,9 @@ def recall(query: str, limit: int = 5) -> dict:
     """Search the user's Atlaso memory for notes relevant to `query`.
 
     Call this to look up relevant memory before answering — past decisions,
-    preferences, project facts. Returns a ranked list of {id, content}. Read-only.
+    preferences, project facts. Returns a ranked list of {id, content, stated_on};
+    stated_on is the day the user stated the note (YYYY-MM-DD) or null when unknown.
+    Read-only.
     """
     out = tools.do_recall(client(), query, limit)
     attest.note_tool_call()
@@ -128,7 +130,7 @@ def forget(id: str) -> dict:
 
 @mcp.tool()
 def recent(limit: int = 10) -> dict:
-    """List the most recent memories (newest first). Read-only."""
+    """List memories by first-save time (newest saved first). `stated_on` is the user's latest statement day (YYYY-MM-DD), or null when unknown; repeating a note does not move it to the top. Read-only."""
     out = tools.do_recent(client(), limit)
     attest.note_tool_call()
     return out

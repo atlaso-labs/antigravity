@@ -126,7 +126,8 @@ class BrainAPI:
         return out
 
     def deposit_batch(self, items: list[dict[str, Any]],
-                      capture_stats: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                      capture_stats: list[dict[str, Any]] | None = None,
+                      reassertions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Push a batch of outbox items. `capture_stats` (optional) rides along as a
         content-free top-level field: the last ≤35 days of cumulative capture
         counters ([{day, attempts, accepted, drops}]). Additive + backward-compatible
@@ -136,6 +137,10 @@ class BrainAPI:
         body: dict[str, Any] = {"items": items}
         if capture_stats is not None:
             body["capture_stats"] = capture_stats
+        # Content-free user re-assertions ([{target_id, tags, captured_at}]),
+        # additive like capture_stats and sent only when present.
+        if reassertions:
+            body["reassertions"] = reassertions
         r = self._client.post("/v1/memories/batch", json=body, timeout=_SYNC_TIMEOUT)
         _raise(r)
         return r.json()

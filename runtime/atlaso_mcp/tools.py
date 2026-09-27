@@ -11,6 +11,8 @@ tools never assume that — they work the same whether or not auto-surfacing exi
 """
 from __future__ import annotations
 
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -73,11 +75,40 @@ POLARITY_GUIDE = (
 )
 
 
+# A full ISO-8601 timestamp (the brain always sends one). Fractions of 3 or 6 digits
+# only, so Python 3.10's fromisoformat and the TypeScript mirrors accept the same set.
+_STATED_RE = re.compile(
+    r"^[1-9]\d{3}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.(?:\d{3}|\d{6}))?)?(?:Z|[+-]\d{2}:\d{2})?$")
+
+
+def stated_on(value: object) -> str | None:
+    """The UTC calendar day ("2026-08-14") the user stated a note, or None when unknown.
+
+    ``value`` is the brain's statement time for the note: ``created_at`` on a
+    ``/v1/recall`` hit and ``stated_at`` on a ``/v1/memories`` row, both resolved by
+    server/enrich/statement_time.py (rung 85bcf262 B1). It is never a processing
+    time (import, sync, L2 rewrite, insertion); an unknown or malformed value stays
+    None, so a date is never manufactured. A timestamp without an offset is UTC.
+    Mirrors: server/mcp_app.py, tools/{cursor,opencode}/lib/mcp.ts; all four are
+    tested against mcp/tests/stated_on_vectors.json."""
+    if not isinstance(value, str) or not _STATED_RE.match(value):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).date().isoformat()
+
+
 def do_recall(client, query: str, limit: int = 5) -> dict[str, Any]:
     res = client.recall(query, limit=limit)
+    # The offline (source "local") path carries no created_at (atlaso_client drops the
+    # cache's insertion time), so those results come back with stated_on null.
     return {
         "results": [
-            {"id": r.get("id"), "content": r.get("content")}
+            {"id": r.get("id"), "content": r.get("content"),
+             "stated_on": stated_on(r.get("created_at"))}
             for r in res.get("results", [])
         ],
         "source": res.get("source"),
@@ -161,7 +192,15 @@ def do_forget(client, id: str) -> dict[str, Any]:
 
 
 def do_recent(client, limit: int = 10) -> dict[str, Any]:
-    return {"memories": client.recent(limit=limit)}
+    """Latest memories, each dated by ``stated_on`` from the brain's ``stated_at``.
+    The row's ``created_at`` is its INSERTION time (an L2 rewrite's rewrite day, an
+    import's import day), not when the user said it, so it is never passed on."""
+    rows = client.recent(limit=limit)
+    return {"memories": [
+        {**{k: v for k, v in r.items() if k not in ("created_at", "stated_at")},
+         "stated_on": stated_on(r.get("stated_at"))}
+        for r in rows if isinstance(r, dict)
+    ]}
 
 
 def do_status(client) -> dict[str, Any]:
