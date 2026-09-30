@@ -26,7 +26,7 @@ export ATLASO_TOOL="${ATLASO_TOOL:-antigravity}"
 
 if [ -d "$TOOL_DIR/runtime" ]; then
   command -v uv >/dev/null 2>&1 || { echo "atlaso-mcp: uv is required to run the memory server" >&2; exit 1; }
-  cd "$TOOL_DIR/runtime" && exec uv run --quiet python -m atlaso_mcp
+  cd "$TOOL_DIR/runtime" && exec uv run --frozen --quiet python -m atlaso_mcp
 else
   PLATFORM="$(cd "$TOOL_DIR/../.." && pwd)"
   PY="${ATLASO_PY:-$PLATFORM/sdk/.venv/bin/python}"

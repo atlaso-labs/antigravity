@@ -49,9 +49,10 @@ export ATLASO_AG_HOST_CWD
 atlaso_run() {
   local mod="$1"
   if [ -d "$_TOOL_DIR/runtime" ]; then
-    # built/installed: portable uv-managed runtime (Python + httpx + mcp, cached)
+    # built/installed: portable uv-managed runtime. --frozen installs exactly the
+    # shipped runtime/uv.lock (hash-checked) and never re-resolves against an index.
     command -v uv >/dev/null 2>&1 || return 0
-    ( cd "$_TOOL_DIR/runtime" && uv run --quiet python -m "$mod" ) || true
+    ( cd "$_TOOL_DIR/runtime" && uv run --frozen --quiet python -m "$mod" ) || true
   else
     # dev/in-repo: antigravity lives at platform/tools/antigravity, so ../.. = platform
     local platform py

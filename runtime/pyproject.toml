@@ -1,13 +1,19 @@
-# Vendored runtime for the Atlaso Antigravity plugin. `uv run` resolves a managed
-# Python + these deps (cached) so the plugin is self-contained. The vendored
-# atlaso_* packages sit alongside and import via `python -m` (cwd path).
+# The one locked runtime shared by every Python connector plugin (claude-code, codex,
+# antigravity, grok-build). Each package.py copies this file and uv.lock beside it into
+# the built plugin's runtime/, and every launcher runs `uv run --frozen`: users install
+# exactly the versions and sha256 hashes recorded in uv.lock, never whatever an index
+# serves that day (security batch B1: SC-3, G8, P15). `package = false`: not a buildable
+# package, just the dependency environment; the vendored atlaso_* packages sit beside it.
+# Refresh on the release train: `uv lock --upgrade` here, review the diff, rebuild the
+# plugins and CLI bundles, run tools/runtime-lock/tests.
 [project]
 name = "atlaso-runtime"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.27,<0.29",
-    "mcp[cli]>=1.27.0,<2",
+    # The MCP server only; mcp's optional `cli` extra (typer, rich) is never used.
+    "mcp>=1.27.0,<2",
     # cryptography 49+ has no macOS x86_64 or universal2 wheel: Intel Macs stay on 48.x, every other platform stays on 49+.
     "cryptography<49; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "cryptography>=49; sys_platform != 'darwin' or platform_machine != 'x86_64'",
