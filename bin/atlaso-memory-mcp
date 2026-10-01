@@ -25,6 +25,17 @@ TOOL_DIR="$(cd "$HERE/.." && pwd)"
 export ATLASO_TOOL="${ATLASO_TOOL:-antigravity}"
 
 if [ -d "$TOOL_DIR/runtime" ]; then
+  # Fast path: the runtime the hooks' warm-up built from the shipped uv.lock and stamped
+  # (hooks/_guard.sh). No uv process and no dependency check on the way to the server.
+  if [ -f "$TOOL_DIR/hooks/_guard.sh" ]; then
+    # shellcheck disable=SC2034  # read by the sourced _guard.sh
+    ATLASO_GUARD_ROOT="$TOOL_DIR"
+    # shellcheck source=/dev/null
+    . "$TOOL_DIR/hooks/_guard.sh"
+    if PY="$(_atlaso_ready_py)"; then
+      cd "$TOOL_DIR/runtime" && exec "$PY" -m atlaso_mcp
+    fi
+  fi
   command -v uv >/dev/null 2>&1 || { echo "atlaso-mcp: uv is required to run the memory server" >&2; exit 1; }
   cd "$TOOL_DIR/runtime" && exec uv run --frozen --quiet python -m atlaso_mcp
 else

@@ -190,4 +190,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    from atlaso_client import _deadline
+
+    from atlaso_ag import STARTED
+
+    sys.exit(_deadline.run_hook(main, tool=_shim.TOOL, event="recall", started=STARTED))

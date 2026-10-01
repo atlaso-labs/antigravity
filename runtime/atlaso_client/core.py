@@ -87,6 +87,9 @@ class Client:
         # out from under the machine's other integrations).
         self._cred_source: str | None = None
         self._cred_token: str | None = None
+        # Wall-clock budget for the brain half of recall(). None = per-request timeouts
+        # only. The connector hook shims set _deadline.NETWORK_BUDGET_S.
+        self.recall_network_budget: float | None = None
         if api is not None:
             self.api = api
         elif _auto_api:
@@ -276,6 +279,7 @@ class Client:
         self.cache.enqueue(
             client_id=client_id, text=text, polarity=polarity,
             evidence_grade=evidence_grade, scope_note=scope_note, tags=tags,
+            tool=self.tool,  # only this tool's own verdict may send it (see _push)
         )
         if push and self._online():
             try:
@@ -353,8 +357,11 @@ class Client:
             # near-dup vs the local commodity cache (offline-safe; no server call)
             related = self._near_dup_route(content, tags, scope, proj)
             if related.get("duplicate"):
-                # the user repeated a live memory: re-date it (return shape unchanged)
-                self._queue_reassert(related, user_span, tags)
+                # the user repeated a live memory: re-date it (return shape unchanged). A hook
+                # REPLAY of a spooled turn (ATLASO_CAPTURE_REPLAY, set by the hook guard) is the
+                # same turn delivered again, never the user saying it again (memo item 30).
+                if not os.environ.get("ATLASO_CAPTURE_REPLAY"):
+                    self._queue_reassert(related, user_span, tags)
                 return {"saved": False, "reason": "near_dup"}
             # Capture polarity (Week-1 Step 4): default "open" (legacy). With
             # ATLASO_CAPTURE_PENDING=1, auto-captures land as "pending" — the
@@ -438,34 +445,70 @@ class Client:
         return out
 
     # ── read ─────────────────────────────────────────────────────────────────
+    def _server_recall(self, query: str, limit: int, project: str | None,
+                       session: str | None) -> dict | None:
+        """The brain half of recall(): the answer, or None to use the local floor. Touches no
+        SQLite connection, so recall() may abandon it on a thread past its budget."""
+        if not self._online():
+            return None
+        try:
+            from . import _retrieval_echo
+            res = self.api.recall(query, limit, project=project, session=session,
+                                  surface="hook_recall",
+                                  prev_event=_retrieval_echo.take_pending())
+            res["source"] = "server"
+            # retrieval_event echo: remember this event id so the NEXT
+            # recall can settle block_emitted server-side (spec 3440342a §c).
+            # The hook renders every returned result, so emitted == bool(results).
+            _retrieval_echo.store(res.pop("_retrieval_event_id", None),
+                                  bool(res.get("results")))
+            from . import _fallback
+            _fallback.record_server_ok()
+            return res
+        except Exception as e:
+            self._note_auth_failure(e)  # fall through to the local floor
+            # Degradation is otherwise invisible (fail-open): count it so
+            # the SessionStart notice can surface a persistent episode.
+            from . import _fallback
+            _fallback.record_fallback()
+            return None
+
     def recall(self, query: str, limit: int = 5, project: str | None = None,
-               session: str | None = None) -> dict:
+               session: str | None = None, network_budget: float | None = None) -> dict:
         """Smart recall from the server when online; commodity local keyword search
         when offline. `project` (per-project scope key) filters server recall to
         personal + this-project memories. `session` (the caller's session id) lets
         the server log which memories were injected for the recall-usefulness judge.
+        `network_budget` (seconds; hooks pass _deadline.NETWORK_BUDGET_S) bounds the whole
+        brain round trip, entitlement check included, by wall clock: past it the server
+        answer is abandoned and the local floor answers instead. None = the per-request
+        timeouts only (MCP tools, CLI).
         Always returns {source, results, is_confident, has_disagreement}. Never raises."""
-        if self._online():
-            try:
-                from . import _retrieval_echo
-                res = self.api.recall(query, limit, project=project, session=session,
-                                      surface="hook_recall",
-                                      prev_event=_retrieval_echo.take_pending())
-                res["source"] = "server"
-                # retrieval_event echo: remember this event id so the NEXT
-                # recall can settle block_emitted server-side (spec 3440342a §c).
-                # The hook renders every returned result, so emitted == bool(results).
-                _retrieval_echo.store(res.pop("_retrieval_event_id", None),
-                                      bool(res.get("results")))
-                from . import _fallback
-                _fallback.record_server_ok()
-                return res
-            except Exception as e:
-                self._note_auth_failure(e)  # fall through to the local floor
-                # Degradation is otherwise invisible (fail-open): count it so
-                # the SessionStart notice can surface a persistent episode.
+        if network_budget is None:
+            network_budget = self.recall_network_budget
+        if network_budget is None:
+            res = self._server_recall(query, limit, project, session)
+        else:
+            from . import _deadline
+            # Cut to what is left of the hook deadline after the local fallback's share.
+            network_budget = _deadline.network_budget(network_budget)
+            done, res = False, None
+            if network_budget > 0.05:
+                try:
+                    done, res = _deadline.call_within(
+                        lambda: self._server_recall(query, limit, project, session),
+                        network_budget)
+                except Exception:
+                    done, res = True, None
+            if not done:
+                # Abandoned past its budget (or no time for a round trip at all): the local
+                # floor answers, and the skip is counted without any content.
+                res = None
+                _deadline.record(self.tool, "recall", "network_deadline")
                 from . import _fallback
                 _fallback.record_fallback()
+        if res is not None:
+            return res
         try:
             # over-fetch then apply the SAME per-project visibility rule as the
             # server, so OFFLINE recall can't leak repo A's project memory into
@@ -887,7 +930,11 @@ class Client:
         stats and the counters simply retry next tick. Queued user re-assertions
         (memo item 30) ride on the batch the same way and are settled from its reply.
         Returns {client_id: server_id} for every settled item."""
-        items = self.cache.list_outbox(limit=_PUSH_BATCH)
+        # Only rows THIS tool queued: the caller has just checked this tool's own entitlement
+        # verdict, never the verdict of the tool that captured a row tagged otherwise
+        # (CodeRedTeam e632b415: the cache file is shared per device). Untagged legacy rows
+        # are never sent by any tool; they stay local (CodeRedTeam a5c54add).
+        items = self.cache.list_outbox(limit=_PUSH_BATCH, tool=self.tool)
         stats = self._stats_payload()
         reasserts = self._list_reasserts()
         if not items and not reasserts and not self._stats_dirty(stats):
@@ -1055,6 +1102,11 @@ class Client:
         """connected? + local counts (cached/pending/cursor) + server health (FMI,
         authoritative deposit_count) when online."""
         out = {"connected": self.connected, **self.cache.counts()}
+        # Display only: legacy rows queued by an older client are kept on this device and never
+        # uploaded, so they are not "pending" to a reader. counts() still includes them.
+        kept = self.cache.kept_local_count()
+        out["pending"] = max(0, out["pending"] - kept)
+        out["kept_on_this_device"] = kept
         h = self.health()
         if h:
             out["fmi"] = h.get("fmi")

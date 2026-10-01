@@ -17,3 +17,9 @@ if a field name is wrong, recall/capture simply no-op and the turn proceeds. MCP
 skill remain the guaranteed path.
 """
 __version__ = "0.1.0"
+
+import time as _time
+
+#: When this hook process started running Python code (monotonic). The hook deadline counts
+#: from here, so interpreter imports spend the budget too (atlaso_client._deadline.run_hook).
+STARTED = _time.monotonic()

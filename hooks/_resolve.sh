@@ -3,13 +3,14 @@
 # Two modes, auto-detected (mirrors bin/atlaso-memory-mcp and the Claude Code
 # connector's hooks/_resolve.sh):
 #   BUILT/installed → a vendored `runtime/` dir sits next to hooks/ (built by
-#     package.py). We run the bundled packages on a uv-managed Python + deps
-#     (`uv run`), so the connector is fully self-contained — no repo, no dev venv.
+#     package.py). We run the bundled packages on the runtime's own venv, built
+#     once from the shipped uv.lock by a detached
+#     `uv sync --frozen`, so the connector is fully self-contained — no repo, no dev venv.
 #   DEV/in-repo     → no runtime/; fall back to the SDK venv + the platform
 #     siblings (what our smoke tests use).
 #
-# `atlaso_run <module>` runs a python module in whichever mode applies, forwarding
-# stdin/stdout, and NEVER returns a turn-breaking non-zero (memory is best-effort).
+# atlaso_fg / atlaso_bg / atlaso_capture (in _guard.sh) run a python module in whichever
+# mode applies, under a hard deadline, and NEVER return a turn-breaking non-zero.
 #
 # Antigravity has no ${PLUGIN_ROOT}-style variable, so hooks are registered with
 # the ABSOLUTE path of each launcher; this resolver derives everything from its own
@@ -46,19 +47,9 @@ _atlaso_host_cwd() {
 ATLASO_AG_HOST_CWD="$(_atlaso_host_cwd)"
 export ATLASO_AG_HOST_CWD
 
-atlaso_run() {
-  local mod="$1"
-  if [ -d "$_TOOL_DIR/runtime" ]; then
-    # built/installed: portable uv-managed runtime. --frozen installs exactly the
-    # shipped runtime/uv.lock (hash-checked) and never re-resolves against an index.
-    command -v uv >/dev/null 2>&1 || return 0
-    ( cd "$_TOOL_DIR/runtime" && uv run --frozen --quiet python -m "$mod" ) || true
-  else
-    # dev/in-repo: antigravity lives at platform/tools/antigravity, so ../.. = platform
-    local platform py
-    platform="$(cd "$_TOOL_DIR/../.." && pwd)"
-    py="${ATLASO_PY:-$platform/sdk/.venv/bin/python}"
-    [ -x "$py" ] || return 0
-    PYTHONPATH="$_TOOL_DIR:$platform/client${PYTHONPATH:+:$PYTHONPATH}" "$py" -m "$mod" || true
-  fi
-}
+# Deadlines, runtime readiness, detached capture and the content-free skip counter live in
+# the shared guard (byte-identical in every Python connector; see its header).
+# shellcheck disable=SC2034  # read by the sourced _guard.sh
+ATLASO_GUARD_ROOT="$_TOOL_DIR"
+# shellcheck source=/dev/null
+. "$_HERE/_guard.sh"

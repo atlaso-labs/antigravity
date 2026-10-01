@@ -39,8 +39,9 @@ _LOCK_NAME = ".connecting"
 _LOCK_TTL = 15 * 60
 
 
-def save_auth(server: str, token: str, user_id: str, device_id: str | None) -> Path:
-    """Atomically + durably write {server, token, user_id, device_id} to auth.json
+def save_auth(server: str, token: str, user_id: str, device_id: str | None,
+              reconnect_proof: str | None = None) -> Path:
+    """Atomically save the bearer, identity and optional reconnect proof to auth.json
     at 0600. Uses an unpredictable temp name (no symlink/TOCTOU), a full-write loop,
     and fsync of both the file and the directory."""
     import tempfile
@@ -51,10 +52,10 @@ def save_auth(server: str, token: str, user_id: str, device_id: str | None) -> P
         os.chmod(p.parent, 0o700)  # owner-only dir
     except OSError:
         pass
-    data = json.dumps(
-        {"server": server, "token": token, "user_id": user_id, "device_id": device_id},
-        indent=2,
-    ).encode("utf-8")
+    auth = {"server": server, "token": token, "user_id": user_id, "device_id": device_id}
+    if reconnect_proof:
+        auth["reconnect_proof"] = reconnect_proof
+    data = json.dumps(auth, indent=2).encode("utf-8")
     # mkstemp: O_EXCL + 0600 + random name in the same dir → atomic, no symlink follow.
     fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".auth.", suffix=".tmp")
     try:
@@ -107,6 +108,66 @@ def _pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
+def _start_device(client: Any, base: str, body: dict[str, Any],
+                  log: Callable[[str], None]) -> tuple[str, int] | None:
+    """Create the ticket, retaining a saved ID when an expired proof needs browser recovery."""
+    r = client.post(f"{base}/v1/device/start", json=body)
+    if (body.get("reconnect_proof") and r.status_code == 409
+            and r.headers.get("X-Atlaso-Error") == "reconnect_unproven"):
+        log("Approve the link opening here to renew this saved connection.")
+        body.pop("reconnect_proof", None)
+        r = client.post(f"{base}/v1/device/start", json=body)
+    r.raise_for_status()
+    try:
+        d = r.json()
+        return d.get("verification_uri_complete") or d.get("verification_uri", base), int(d.get("expires_in", 600))
+    except (ValueError, KeyError, TypeError) as e:
+        log(f"  Error: unexpected response from {base} ({e}).")
+        return None
+
+
+def _start_body(label: str, challenge: str, redirect_uri: str, state: str,
+                tool: str | None, existing: dict[str, Any]) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "label": label, "code_challenge": challenge,
+        "redirect_uri": redirect_uri, "state": state,
+    }
+    if tool:
+        body["tool"] = tool[:40]
+    if existing.get("device_id"):
+        body["device_id"] = existing["device_id"]
+        if existing.get("reconnect_proof"):
+            body["reconnect_proof"] = existing["reconnect_proof"]
+    return body
+
+
+def _save_device_token(client: Any, base: str, code: str, verifier: str,
+                       log: Callable[[str], None]) -> int:
+    tr = client.post(f"{base}/v1/device/token", json={"code": code, "code_verifier": verifier})
+    if tr.status_code != 200:
+        log(f"  Error: token exchange failed ({tr.status_code}).")
+        return 1
+    try:
+        t = tr.json()
+    except ValueError:
+        log("  Error: unexpected token response.")
+        return 1
+    status = t.get("status")
+    if status == "approved":
+        tok, uid = t.get("token"), t.get("user_id")
+        if not tok or not uid:
+            log("  Error: malformed approval from the server.")
+            return 1
+        p = save_auth(base, tok, uid, t.get("device_id"), t.get("reconnect_proof"))
+        log(f"\n  Connected as {uid}. Saved to {p}")
+        return 0
+    if status == "denied":
+        log("\n  Authorization could not be verified — reconnect to try again.")
+        return 1
+    log("\n  That link expired — reconnect to try again.")
+    return 1
+
+
 def connect(server: str | None = None, *, open_browser: bool = True,
             tool: str | None = None, log: Callable[[str], None] = print) -> int:
     """Run the connect handshake to completion. Returns 0 on success.
@@ -128,6 +189,9 @@ def connect(server: str | None = None, *, open_browser: bool = True,
     # "<Tool> wants to connect". Passed by the connector, else read from env.
     tool = tool or os.environ.get("ATLASO_TOOL")
     existing = config.load_auth() or {}
+    saved_device_id = existing.get("device_id")
+    if saved_device_id and not existing.get("reconnect_proof"):
+        log("Approve the link opening here to renew this saved connection.")
 
     verifier, challenge = _pkce_pair()
     state = secrets.token_urlsafe(16)
@@ -165,26 +229,14 @@ def connect(server: str | None = None, *, open_browser: bool = True,
     port = httpd.server_address[1]
     redirect_uri = f"http://127.0.0.1:{port}/cb"
 
-    start_body: dict[str, Any] = {
-        "label": label, "code_challenge": challenge,
-        "redirect_uri": redirect_uri, "state": state,
-    }
-    if tool:
-        start_body["tool"] = tool[:40]
-    if existing.get("device_id"):
-        start_body["device_id"] = existing["device_id"]  # reconnect rotates in place
+    start_body = _start_body(label, challenge, redirect_uri, state, tool, existing)
 
     try:
         with httpx.Client(timeout=30.0) as client:
-            r = client.post(f"{base}/v1/device/start", json=start_body)
-            r.raise_for_status()
-            try:
-                d = r.json()
-                verify_url = d.get("verification_uri_complete") or d.get("verification_uri", base)
-                expires_in = int(d.get("expires_in", 600))
-            except (ValueError, KeyError, TypeError) as e:
-                log(f"  Error: unexpected response from {base} ({e}).")
+            started = _start_device(client, base, start_body, log)
+            if started is None:
                 return 1
+            verify_url, expires_in = started
 
             if open_browser and not os.environ.get("ATLASO_NO_BROWSER"):
                 try:
@@ -204,36 +256,14 @@ def connect(server: str | None = None, *, open_browser: bool = True,
                 httpd.handle_request()  # one request per loop (favicon etc. just 400)
             code = result.get("code")
             if not code:
-                log("\n  Timed out waiting for approval — reconnect to try again.")
+                log("\n  Timed out waiting for approval — check the authorization page, then run the connect command again.")
                 return 1
 
-            tr = client.post(
-                f"{base}/v1/device/token",
-                json={"code": code, "code_verifier": verifier},
-            )
-            if tr.status_code != 200:
-                log(f"  Error: token exchange failed ({tr.status_code}).")
-                return 1
-            try:
-                t = tr.json()
-            except ValueError:
-                log("  Error: unexpected token response.")
-                return 1
-            status = t.get("status")
-            if status == "approved":
-                tok, uid = t.get("token"), t.get("user_id")
-                if not tok or not uid:
-                    log("  Error: malformed approval from the server.")
-                    return 1
-                p = save_auth(base, tok, uid, t.get("device_id"))
-                log(f"\n  Connected as {uid}. Saved to {p}")
-                return 0
-            if status == "denied":
-                log("\n  Authorization could not be verified — reconnect to try again.")
-                return 1
-            log("\n  That link expired — reconnect to try again.")
-            return 1
+            return _save_device_token(client, base, code, verifier, log)
     except httpx.HTTPStatusError as e:
+        if e.response.headers.get("X-Atlaso-Error") == "reconnect_unproven":
+            log("This saved connection could not be renewed. Check its entry in Atlaso Settings, then try again.")
+            return 1
         log(f"  Error: server returned {e.response.status_code} from {base}.")
         return 1
     except httpx.HTTPError as e:

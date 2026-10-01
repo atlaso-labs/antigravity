@@ -60,8 +60,8 @@ def should_flush(cache) -> bool:
     the last-flush marker when it says yes (so the debounce window starts at the
     decision, not at sync completion). Never raises."""
     try:
-        counts = cache.counts()
-        pending = int(counts.get("pending") or 0)
+        # only rows a sync could send: legacy untagged rows stay local and never upload
+        pending = int(cache.sendable_count())
         if pending <= 0:
             return False
         if _age(_lease_path()) < LEASE_TTL:

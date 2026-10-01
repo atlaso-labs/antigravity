@@ -46,9 +46,24 @@ def make_client():
     (tests inject a fake client). Tagged with this tool id so the client's plan
     entitlement knows which tool is asking (free = only the active tool is
     cloud-linked; others run local-only)."""
+    from atlaso_client import Client, _deadline
+
+    client = Client(tool=TOOL)
+    # Hooks bound the brain round trip by wall clock; past it recall answers from the
+    # local cache (rung "hooks never hang").
+    client.recall_network_budget = _deadline.NETWORK_BUDGET_S
+    return client
+
+
+def make_local_client():
+    """The capture hooks' client: the local cache only, with NO network before the turn is
+    written. Resolving the tool credential can mint one over the network (device exchange,
+    8 s per read), and a capture worker cut off there used to lose the turn before it reached
+    the cache (rung "hooks never hang", round 2). What reaches the cloud, and when, stays with
+    sync, which builds the full client and applies the entitlement gate."""
     from atlaso_client import Client
 
-    return Client(tool=TOOL)
+    return Client(tool=TOOL, _auto_api=False)
 
 
 def maybe_autoconnect() -> bool:

@@ -46,23 +46,33 @@ def main() -> int:
         return 0
     payload = _shim.read_payload()
     try:
-        client = _shim.make_client()
+        client = _shim.make_local_client()
     except Exception:
         return 0
     try:
         saved = run(payload, client)
         _shim.log("capture", f"saved={saved}")
-        # Best-effort flush to the cloud (no SessionEnd in Antigravity → the Stop
-        # hook doubles as the sync tick). Never raises.
-        try:
-            client.sync_once()
-        except Exception as e:
-            _shim.log("capture", f"sync error {e!r}")
     except Exception as e:
         _shim.log("capture", f"error {e!r}")
     finally:
         try:
             client.close()
+        except Exception:
+            pass
+    # Best-effort flush to the cloud (no SessionEnd in Antigravity → the Stop hook doubles
+    # as the sync tick), only AFTER the turn is in the local cache: this client resolves the
+    # tool credential and the entitlement over the network. Never raises.
+    try:
+        net = _shim.make_client()
+    except Exception:
+        return 0
+    try:
+        net.sync_once()
+    except Exception as e:
+        _shim.log("capture", f"sync error {e!r}")
+    finally:
+        try:
+            net.close()
         except Exception:
             pass
     return 0

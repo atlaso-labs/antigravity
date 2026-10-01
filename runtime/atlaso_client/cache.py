@@ -62,6 +62,7 @@ bytes on every version.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -174,7 +175,38 @@ CREATE TABLE IF NOT EXISTS reassert_outbox (
 _MIGRATIONS = (
     "ALTER TABLE outbox ADD COLUMN edge_blocks INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE capture_stats ADD COLUMN hours_json TEXT NOT NULL DEFAULT '{}'",
+    # The connector that queued the row (rung "hooks never hang" round 3, CodeRedTeam e632b415).
+    # The cache file is shared by every Python connector on the device, and a capture hook
+    # queues its turn with no network and no entitlement verdict. Only a sync by THAT tool,
+    # after its own verdict said cloud-linked, may send the row. NULL = LEGACY (queued by an
+    # older client, capturing tool unknown): never sent by anyone, kept locally (see TOOLLESS).
+    "ALTER TABLE outbox ADD COLUMN tool TEXT",
 )
+
+# `list_outbox(tool=...)` default: every row, whatever tool queued it (inspection, tests).
+ANY_TOOL = object()
+
+# Outbox `tool` values (CodeRedTeam a5c54add, Tier A): a tool name = queued by that connector,
+# sendable only by that connector's own sync; TOOLLESS ('') = queued by a tool-less Client,
+# sendable only by a tool-less sync; NULL = LEGACY (queued before the column existed, capturing
+# tool unknowable). Legacy rows are never uploaded by anyone: they stay on the device, still
+# recallable locally. A NULL row is adopted (given its tool) only from a provenance record the
+# capturing client itself wrote at capture time (_PROVENANCE_PREFIX in cache_meta); rows made by
+# older clients have none and stay local for good. The record binds the row id (its key) AND a
+# digest of the row as captured (_outbox_digest), so a different row that later reuses the id
+# (an older client replaying it) is never adopted; Cache.remove deletes the record with the row
+# (CodeRedTeam 9ddd4105).
+TOOLLESS = ""
+_PROVENANCE_PREFIX = "outbox_tool:"
+
+
+def _outbox_digest(text: Any, polarity: Any, evidence_grade: Any, scope_note: Any,
+                   tags_json: Any, created_at: Any) -> str:
+    """Content digest of one outbox row as stored: the provenance record carries it, and
+    adoption tags a NULL row only when the row still has exactly these bytes."""
+    blob = json.dumps([text, polarity, evidence_grade, scope_note, tags_json, created_at],
+                      ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 # Capture's near-dup bucket (rung 404a1485). Two plain nullable columns on
@@ -757,15 +789,38 @@ class Cache:
         scope_note: str | None = None,
         tags: list[str] | None = None,
         created_at: str | None = None,
+        tool: str | None = None,
     ) -> None:
         created_at = created_at or _now_iso()
         tags_json = json.dumps(tags or [])
-        self._conn.execute(
-            "INSERT OR REPLACE INTO outbox"
-            "(client_id, text, polarity, evidence_grade, scope_note, tags_json, created_at, attempts) "
-            "VALUES(?,?,?,?,?,?,?,0)",
-            (client_id, text, polarity, evidence_grade, scope_note, tags_json, created_at),
-        )
+        if self._outbox_has_tool():
+            self._conn.execute(
+                "INSERT OR REPLACE INTO outbox"
+                "(client_id, text, polarity, evidence_grade, scope_note, tags_json, created_at, attempts, tool) "
+                "VALUES(?,?,?,?,?,?,?,0,?)",
+                (client_id, text, polarity, evidence_grade, scope_note, tags_json, created_at,
+                 tool or TOOLLESS),  # never NULL: NULL means legacy, which is never sent
+            )
+        else:
+            # The column could not be added (the file was locked at open and is still locked
+            # for DDL). Keeping the turn beats tagging it: it is queued untagged, which is NOT
+            # sendable, plus a provenance record in the same transaction. The first open that
+            # can add the column adopts it from that record (_adopt_provenance); until then it
+            # stays local. Logged so the fallback is visible.
+            _telemetry.log("cache", "outbox_untagged")
+            self._conn.execute(
+                "INSERT OR REPLACE INTO outbox"
+                "(client_id, text, polarity, evidence_grade, scope_note, tags_json, created_at, attempts) "
+                "VALUES(?,?,?,?,?,?,?,0)",
+                (client_id, text, polarity, evidence_grade, scope_note, tags_json, created_at),
+            )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO cache_meta(k, v) VALUES(?, ?)",
+                (_PROVENANCE_PREFIX + client_id, json.dumps({
+                    "tool": tool or TOOLLESS,
+                    "digest": _outbox_digest(text, polarity, evidence_grade, scope_note,
+                                             tags_json, created_at)})),
+            )
         # optimistic local row so recall sees it immediately (pending=1, no seq yet)
         cols, marks, _, extra = self._scope_write(tags_json)
         self._conn.execute(
@@ -778,12 +833,91 @@ class Cache:
         self._index_fts(client_id, text)
         self._conn.commit()
 
-    def list_outbox(self, limit: int = 100) -> list[dict]:
+    def _outbox_has_tool(self) -> bool:
+        """Does this file's outbox carry the `tool` column? Adds it when an earlier open could
+        not (a busy file at open skips its migrations). A positive answer is remembered."""
+        if getattr(self, "_outbox_tool_ready", False):
+            return True
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(outbox)")}
+        if "tool" not in cols:
+            try:
+                self._conn.execute("ALTER TABLE outbox ADD COLUMN tool TEXT")
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                return False  # still busy: callers fall back to the untagged behaviour
+        self._adopt_provenance()
+        self._outbox_tool_ready = True
+        return True
+
+    _DIGEST_COLUMNS = ("text", "polarity", "evidence_grade", "scope_note", "tags_json",
+                       "created_at")
+
+    def _adopt_provenance(self) -> None:
+        """Tag the untagged rows THIS client family queued while the column was missing, from
+        the provenance record written with each of them. Only a NULL row with a record whose
+        digest matches the row's current bytes is touched; a legacy row without one, a row that
+        replaced the captured one under the same id, or a record without a digest stays NULL
+        (local-only). Every record read is consumed. Best effort: a busy file leaves the
+        records for the next open.
+
+        Atomic (CodeRedTeam 2d44299d): the digest check and the tag are ONE write transaction
+        (BEGIN IMMEDIATE, so no other connection can replace the row between them), and the
+        tagging UPDATE itself requires every digested column to still hold the bytes that were
+        checked (rowcount 0 = the row changed: it stays NULL, local-only)."""
+        cols = self._DIGEST_COLUMNS
+        same_bytes = " AND ".join(f"{c} IS ?" for c in cols)
+        find = ("SELECT k, v FROM cache_meta WHERE substr(k, 1, ?) = ?",
+                (len(_PROVENANCE_PREFIX), _PROVENANCE_PREFIX))
+        try:
+            # the common case (no records) takes no write lock; records are re-read
+            # under the lock, so the unlocked look decides nothing
+            if not self._conn.execute(*find).fetchone():
+                return
+            self._write_txn()
+            recs = self._conn.execute(*find).fetchall()
+            if not recs:
+                self._conn.commit()
+                return
+            adopted = 0
+            for r in recs:
+                cid = r["k"][len(_PROVENANCE_PREFIX):]
+                try:
+                    rec = json.loads(r["v"])
+                    tool, digest = rec["tool"], rec["digest"]
+                except (ValueError, TypeError, KeyError):
+                    tool = digest = None  # no content binding: never adopt
+                row = self._conn.execute(
+                    "SELECT " + ", ".join(cols) + " FROM outbox "
+                    "WHERE client_id = ? AND tool IS NULL", (cid,)).fetchone()
+                if (row is not None and isinstance(tool, str) and isinstance(digest, str)
+                        and _outbox_digest(*row) == digest):
+                    adopted += self._conn.execute(
+                        "UPDATE outbox SET tool = ? WHERE client_id = ? AND tool IS NULL AND "
+                        + same_bytes, (tool, cid, *tuple(row))).rowcount
+                self._conn.execute("DELETE FROM cache_meta WHERE k = ?", (r["k"],))
+            self._conn.commit()
+            _telemetry.log("cache", "outbox_provenance_adopted", n=len(recs), tagged=adopted)
+        except sqlite3.OperationalError:
+            try:
+                self._conn.rollback()
+            except sqlite3.Error:
+                pass
+
+    def list_outbox(self, limit: int = 100, *, tool: Any = ANY_TOOL) -> list[dict]:
+        """Queued rows, oldest first. `tool` scopes what a SYNC may send: a tool name returns
+        that tool's own rows only; None (a tool-less client) returns tool-less rows only. Legacy
+        untagged rows (NULL) are returned to NO sync: their capturing tool is unknown, so no
+        verdict can release them (CodeRedTeam a5c54add). The filter runs before LIMIT."""
+        where, args = "", ()
+        if tool is not ANY_TOOL and not self._outbox_has_tool():
+            return []  # no column → every row is legacy/untagged → nothing is sendable
+        elif tool is not ANY_TOOL:
+            where, args = "WHERE tool = ? ", (tool or TOOLLESS,)
         rows = self._conn.execute(
             "SELECT client_id, text, polarity, evidence_grade, scope_note, tags_json, "
             "attempts, edge_blocks, created_at "
-            "FROM outbox ORDER BY created_at LIMIT ?",
-            (limit,),
+            "FROM outbox " + where + "ORDER BY created_at LIMIT ?",
+            (*args, limit),
         ).fetchall()
         out = []
         for r in rows:
@@ -839,7 +973,10 @@ class Cache:
     def oldest_pending_at(self) -> str | None:
         """created_at of the oldest queued item (ISO), or None when empty — used
         by the flush debounce to force a push when items are going stale."""
-        r = self._conn.execute("SELECT min(created_at) AS m FROM outbox").fetchone()
+        if not self._outbox_has_tool():
+            return None  # every row is legacy: nothing a sync could send
+        r = self._conn.execute(
+            "SELECT min(created_at) AS m FROM outbox WHERE tool IS NOT NULL").fetchone()
         return r["m"] if r and r["m"] else None
 
     def resolve_outbox(
@@ -1092,6 +1229,9 @@ class Cache:
             self._prune(deposit_id)
             n = self._conn.execute("DELETE FROM outbox WHERE client_id = ?",
                                    (deposit_id,)).rowcount
+            # its capture-time provenance goes with it: a later row reusing the id is not it
+            self._conn.execute("DELETE FROM cache_meta WHERE k = ?",
+                               (_PROVENANCE_PREFIX + deposit_id,))
             n += self._conn.execute("DELETE FROM quarantine WHERE client_id = ?",
                                     (deposit_id,)).rowcount
             if n:
@@ -1108,6 +1248,22 @@ class Cache:
         quarantined = self._conn.execute("SELECT count(*) AS n FROM quarantine").fetchone()["n"]
         return {"cached": int(total), "pending": int(pending),
                 "quarantined": int(quarantined), "cursor": self.get_cursor()}
+
+    def kept_local_count(self) -> int:
+        """Queued legacy rows (NULL tool) that stay on this device and are never uploaded.
+        Display only (Client.status): counts() keeps reporting them inside `pending`."""
+        if not self._outbox_has_tool():
+            return int(self._conn.execute("SELECT count(*) AS n FROM outbox").fetchone()["n"])
+        return int(self._conn.execute(
+            "SELECT count(*) AS n FROM outbox WHERE tool IS NULL").fetchone()["n"])
+
+    def sendable_count(self) -> int:
+        """Queued rows SOME sync may send: every tagged row. Legacy untagged rows are kept on
+        the device and never uploaded, so they must not keep forcing flushes (_flush)."""
+        if not self._outbox_has_tool():
+            return 0  # every row is legacy
+        return int(self._conn.execute(
+            "SELECT count(*) AS n FROM outbox WHERE tool IS NOT NULL").fetchone()["n"])
 
     # ── capture-quality telemetry (content-free daily counters) ───────────────
     def _apply_drop(self, day: str, reason: str, n: int) -> None:
