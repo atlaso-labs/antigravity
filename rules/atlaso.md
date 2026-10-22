@@ -5,7 +5,7 @@ their tools and projects). Relevant memories may already appear as an
 `=== Atlaso Memory ===` block before your first step; use it when relevant, and use the
 server deliberately for anything more:
 
-- **Recall first** when prior context would help — at the start of a task, when the
+- **Recall first** when prior context would help: at the start of a task, when the
   user references a past decision, or before a choice that might contradict an
   earlier one. Tool: `recall(query)`.
 - **Remember** durable facts, decisions (with their reason), stable preferences, and

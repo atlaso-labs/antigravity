@@ -44,6 +44,28 @@ class EdgeBlocked(Exception):
         self.content_type = content_type
 
 
+class ForgetPending(Exception):
+    """The brain RECORDED the forget but has not finished removing the memory: a 503
+    carrying the Atlaso response marker and X-Atlaso-Error: forget_pending (server
+    developer_api.forget_pending_error). RETRYABLE by contract: the same forget, sent
+    again, finishes it and is safe to repeat. Until then the memory may still be
+    recalled, so the caller keeps its local row. `retry_after_s` is the server's
+    Retry-After in seconds, or None when absent or unparseable. A 503 without both
+    markers (an edge or proxy page) stays a plain transient HTTPStatusError."""
+
+    def __init__(self, message: str, *, retry_after_s: float | None = None):
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
+
+
+def _retry_after_s(r: httpx.Response) -> float | None:
+    try:
+        v = float(r.headers.get("retry-after", ""))
+    except ValueError:
+        return None
+    return v if 0 <= v <= 3600 else None
+
+
 # State-transition codes the client acts on. Anything else on a verified 401/403
 # (an unknown future code) fails SAFE: treated as transient, item stays queued.
 _AUTH_CODES = ("invalid_token", "reconnect_required")
@@ -177,6 +199,10 @@ class BrainAPI:
 
     def delete(self, deposit_id: str) -> dict[str, Any]:
         r = self._client.delete(f"/v1/memories/{deposit_id}")
+        if (r.status_code == 503 and r.headers.get("x-atlaso-response") == "1"
+                and r.headers.get("x-atlaso-error") == "forget_pending"):
+            raise ForgetPending("forget recorded, not finished (503 forget_pending)",
+                                retry_after_s=_retry_after_s(r))
         _raise(r)
         return r.json()
 

@@ -13,6 +13,8 @@ import re
 import unicodedata
 from datetime import datetime, timezone
 
+from ._capture import scrub as _scrub_credentials
+
 _YEAR_AFTER_DAYS = 335  # ~11 months: older notes carry the year, recent ones do not
 # Fixed English abbreviations (never strftime('%b'), which follows the process locale);
 # the TypeScript mirrors (tools/cursor, tools/opencode lib/render.ts) use the same table.
@@ -154,11 +156,20 @@ def _fold(s: str) -> tuple[str, list[int]]:
     return "".join(out), origin
 
 
+# A credential-scrub marker in the folded (lowercased) view: [REDACTED] or [REDACTED:kind].
+_SCRUB_MARK_RE = re.compile(r"\[redacted(?::[a-z0-9_]+)?\]")
+
+
+def _in_scrub_marker(i: int, held: list[tuple[int, int]]) -> bool:
+    return any(a <= i < b for a, b in held)
+
+
 def _neutralize_markers(s: str) -> str:
     """Step 3: replace every fence-forging marker (plus its '=' decoration) with
     _FENCE_TOKEN in one left-to-right pass on the folded view. One pass is enough: the
     token contains letters, so text on its two sides can never join into a new marker."""
     folded, origin = _fold(s)
+    held = [m.span() for m in _SCRUB_MARK_RE.finditer(folded)]
     out: list[str] = []
     pos_f = pos = 0  # consumed prefix, in folded and in original coordinates
     for m in _MARKER_RE.finditer(folded):
@@ -168,11 +179,14 @@ def _neutralize_markers(s: str) -> str:
         # The runs of non-alphanumeric characters right before and after the marker. It
         # forges a fence when either run holds '=' (or it starts with END); a run holding
         # '=' is replaced with the marker, minus the space/tab padding at its outer edge.
+        # A run never reaches into a credential-scrub marker ("[REDACTED...]"): the hook
+        # line is scrubbed before it is sanitized (redact_line), so a marker can sit
+        # right next to a fence decoration and must keep its brackets.
         lo = a
-        while lo > pos_f and not folded[lo - 1].isalnum():
+        while lo > pos_f and not folded[lo - 1].isalnum() and not _in_scrub_marker(lo - 1, held):
             lo -= 1
         hi = b
-        while hi < len(folded) and not folded[hi].isalnum():
+        while hi < len(folded) and not folded[hi].isalnum() and not _in_scrub_marker(hi, held):
             hi += 1
         pre, post = "=" in folded[lo:a], "=" in folded[b:hi]
         if not (pre or post or m.group().startswith("end")):
@@ -212,6 +226,94 @@ def sanitize_line(s: object, mode: str = "collapse") -> str:
 _sanitize = sanitize_line  # earlier private name; kept for existing importers
 
 
+# How many scrub/sanitize rounds ``redact_line`` runs after the raw-text scrub. Each
+# round only replaces matches with markers; real notes settle in one or two. A line that
+# has not settled by then is returned as the last round left it, and the renderer
+# contract test (test_redact_fixpoint) proves a further scrub changes nothing.
+_REDACT_ROUNDS = 4
+
+
+def redact_line(s: object, mode: str = "collapse") -> str:
+    """One stored string -> one safe, credential-redacted line. Every note text and short
+    form goes through this before it can reach a prompt, so a credential stored by an
+    older client, an import, or in local-only/offline mode (where only the connector ever
+    scrubbed it) is replaced in place; the note itself is never dropped.
+
+    Order matters (CodeRedTeam 8af8fbbe CRT-1):
+      1. scrub the text AS STORED (``redact_text``), while its line breaks still end
+         values: a quoted value with no closing quote stops at the line end, so a
+         multiword passphrase is masked whole, exactly as the server and the MCP
+         ``redact_text`` paths mask it. Collapsing the line first left the tail visible;
+      2. ``sanitize_line`` (one line, no hidden characters, no forged fence);
+      3. scrub the sanitized line again and re-sanitize until nothing changes, so hidden
+         characters cannot split a token past the scrub and the printed line is a fixed
+         point of the scrub (a second scrub removes nothing; at most it relabels one of
+         its own markers, see ``_unlabel``).
+    The scrub is the connector credential scrub (``_capture.scrub``: the server's full
+    detection set, kept in a byte-identical copy in ``_scrub`` with a drift test, plus the
+    server's markers). Text with no credential keeps its bytes (``sanitize_line`` of the
+    stored text). The TypeScript mirrors (tools/cursor, tools/opencode lib/render.ts,
+    ``redactLine``) do the same; shared expectations: client/tests/fixtures/
+    redact_contract.json."""
+    if mode not in SPACING_MODES:
+        raise ValueError(f"unknown spacing mode {mode!r}")
+    if not isinstance(s, str) or not s:
+        return ""
+    line = sanitize_line(redact_text(s), mode)
+    for _ in range(_REDACT_ROUNDS):
+        if not line:
+            return line
+        red, _kinds = _scrub_credentials(line)
+        if _unlabel(red) == _unlabel(line):
+            # Nothing new removed. The canonical scrub relabels its own marker on a second
+            # pass in URI userinfo ("[REDACTED]" <-> "[REDACTED:residue]", period 2), so a
+            # label-only change counts as settled; the line is returned as it was.
+            return line
+        line = sanitize_line(red, mode)
+    return line
+
+
+_SCRUB_LABEL_RE = re.compile(r"\[REDACTED(?::[a-z0-9_]+)?\]")
+
+
+def _unlabel(s: str) -> str:
+    """``s`` with every scrub marker written as plain ``[REDACTED]``."""
+    return _SCRUB_LABEL_RE.sub("[REDACTED]", s)
+
+
+def redact_text(s: object) -> object:
+    """Credential redaction for model-visible Atlaso text that is NOT printed as a hook
+    line: the MCP ``recall``/``recent``/``ambient`` tool results and the session-start
+    brief. Same scrub and markers as ``redact_line``, but no
+    sanitizing: spacing, line breaks and every other byte are left alone, so text with no
+    credential is returned unchanged (the same object). Hidden characters are removed
+    only when that is what exposes a split credential (``sk-...<U+200B>...``). Never
+    drops the text; a non-string is returned as is. Text the scrub changed is scrubbed
+    again until a pass removes nothing more (``_settle``), so a second scrub of the result
+    removes nothing (CodeRedTeam 8af8fbbe CRT-1 contract)."""
+    if not isinstance(s, str) or not s:
+        return s
+    red, _ = _scrub_credentials(s)
+    bare = _drop_hidden(red)
+    if bare != red:
+        rejoined, kinds = _scrub_credentials(bare)
+        if kinds:
+            return _settle(rejoined)
+    return s if red == s else _settle(red)
+
+
+def _settle(red: str) -> str:
+    """Scrub already-scrubbed text again until a pass removes nothing (a label-only change
+    counts as settled, see ``_unlabel``). The canonical scrub can remove a little more on a
+    second pass: punctuation glued to a marker ("password=[REDACTED]; later")."""
+    for _ in range(_REDACT_ROUNDS):
+        again, _kinds = _scrub_credentials(red)
+        if _unlabel(again) == _unlabel(red):
+            return red
+        red = again
+    return red
+
+
 def _date_label(created_at: object, now: datetime) -> str | None:
     """'Aug 14' (UTC calendar day, English month, no zero pad); 'Aug 14 2025' when the
     note is more than ~11 months older than ``now``. None when the server sent no or a
@@ -239,22 +341,43 @@ def undated_first(lines: list[tuple[bool, str]]) -> list[str]:
     return [line for dated, line in lines if not dated] + [line for dated, line in lines if dated]
 
 
+def _short_content(r: dict, full: str, mode: str) -> str | None:
+    """The note's short form (the ranker's optional ``short`` field), sanitized and
+    redacted like the content, or None when absent, empty or no shorter than the content."""
+    short = redact_line(r.get("short"), mode)
+    return short if short and len(short) < len(full) else None
+
+
+# The header never names the user: the connected user id is an account identifier and
+# must not be put in front of the model (SecurityEngineer 4c26fd7d finding 3).
+RECALL_HEAD = ("=== ATLASO MEMORY ===\n"
+               "Recalled notes from prior sessions for user \"you\".\n")
+
+
 def recall_block(result: dict, *, uid: str = "you", show_scope: bool = True,
-                 now: datetime | None = None) -> str | None:
+                 now: datetime | None = None, tool: str | None = None,
+                 budget: int | None = None) -> str | None:
     """Build the recall block from a /v1/recall response dict, or None if no
     results. Each line carries the note's date when the server sent created_at
     (rung 85bcf262 card B1); ``now`` decides whether the year is shown. Undated
-    lines come first (``undated_first``)."""
+    lines come first (``undated_first``). ``uid`` is accepted for older callers and
+    ignored: the header always says "you" (RECALL_HEAD). Note text and short forms are
+    credential-redacted (``redact_line``) before fitting, so the budget measures what is
+    printed.
+
+    The block is fitted to ``budget`` UTF-8 bytes (default: ``tool``'s budget in
+    ``_inject.HOSTS``): whole notes in rank order, a note's short form when only that
+    fits, lower-ranked notes left out rather than the block going over (``_inject``)."""
+    from . import _inject
+
     now = now or datetime.now(timezone.utc)
     results = (result or {}).get("results") or []
     if not results:
         return None
-    lines: list[tuple[bool, str]] = []
-    for r in results:
+
+    def note_line(r: dict, content: str, date: str | None) -> str:
         hd = bool(r.get("has_disagreement"))
-        date = _date_label(r.get("created_at"), now)
-        line = ("- " + (f"[{date}] " if date else "") + ("[conflict] " if hd else "")
-                + sanitize_line(r.get("content", "")))
+        line = "- " + (f"[{date}] " if date else "") + ("[conflict] " if hd else "") + content
         peers = r.get("conflict_peers") or []
         if hd and peers:
             n = len(peers)
@@ -262,10 +385,42 @@ def recall_block(result: dict, *, uid: str = "you", show_scope: bool = True,
         scope = sanitize_line(r.get("scope"))
         if show_scope and scope:
             line += f"  [{scope}]"
-        lines.append((date is not None, line))
-    return (
-        "=== ATLASO MEMORY ===\n"
-        f"Recalled notes from prior sessions for user \"{sanitize_line(uid)}\".\n"
-        + "\n".join(undated_first(lines))
-        + "\n=== END ATLASO MEMORY ==="
-    )
+        return line
+
+    cands: list[_inject.Candidate] = []
+    for r in results:
+        date = _date_label(r.get("created_at"), now)
+        content = redact_line(r.get("content", ""))
+        short = _short_content(r, content, "collapse")
+        cands.append(_inject.Candidate(note_line(r, content, date),
+                                       note_line(r, short, date) if short else None,
+                                       date is not None))
+    tail = "\n=== END ATLASO MEMORY ==="
+    return _inject.fit_block(RECALL_HEAD, tail, cands,
+                             _inject.budget_for(tool) if budget is None else budget,
+                             undated_first)
+
+
+def fenced_block(results: list[dict], banner: str, mode: str, *, now: datetime | None = None,
+                 tool: str | None = None, budget: int | None = None) -> str | None:
+    """The Codex/Antigravity block: ``=== <banner> ===`` fences, one dated line per
+    non-empty note (no conflict marker, no scope), in ``mode`` spacing, credential-redacted
+    (``redact_line``), fitted to the
+    tool's budget exactly like ``recall_block``. None when nothing is usable."""
+    from . import _inject
+
+    now = now or datetime.now(timezone.utc)
+    cands: list[_inject.Candidate] = []
+    for r in results or []:
+        content = redact_line(r.get("content", ""), mode)
+        if not content:
+            continue
+        date = _date_label(r.get("created_at"), now)
+        prefix = "- " + (f"[{date}] " if date else "")
+        short = _short_content(r, content, mode)
+        cands.append(_inject.Candidate(prefix + content, prefix + short if short else None,
+                                       date is not None))
+    fence = f"=== {banner} ==="
+    return _inject.fit_block(fence + "\n", "\n" + fence, cands,
+                             _inject.budget_for(tool) if budget is None else budget,
+                             undated_first)

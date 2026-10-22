@@ -23,6 +23,11 @@ TOOL_DIR="$(cd "$HERE/.." && pwd)"
 # exported here as a belt-and-braces default so the right tool id travels with the
 # process even if the config entry omits it.
 export ATLASO_TOOL="${ATLASO_TOOL:-antigravity}"
+# The host starts this server in the user's project; the launcher then cds into the
+# vendored runtime/, so stamp the caller's directory first. MCP recall reads it for the
+# same per-project scope the prompt hook uses (task 1b7cb9b7). Unset, $HOME or a tool
+# directory resolves to personal-only, never to another project.
+export ATLASO_CALLER_PWD="${ATLASO_CALLER_PWD:-$PWD}"
 
 if [ -d "$TOOL_DIR/runtime" ]; then
   # Fast path: the runtime the hooks' warm-up built from the shipped uv.lock and stamped

@@ -25,7 +25,7 @@ import json
 import os
 import time
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 
 from . import _shim
 from .transcript import last_prompt
@@ -44,23 +44,17 @@ def _clean(text: str) -> str:
     return _render.sanitize_line(text, "join_lines")
 
 
-def render(results: list[dict], now: datetime | None = None) -> str | None:
+def render(results: list[dict], now: datetime | None = None,
+           budget: int | None = None) -> str | None:
     """Build the injection block from recall results, or None if nothing usable.
     Each line carries its note's UTC day when the server sent created_at (rung
     85bcf262 card B1; the shared label is atlaso_client._render._date_label).
-    Undated lines come first (``_render.undated_first``)."""
+    Undated lines come first (``_render.undated_first``). Fitted to Antigravity's
+    budget (atlaso_client._inject: whole notes in rank order)."""
     from atlaso_client import _render  # lazy, like _shim: importing this module stays dependency-free
 
-    now = now or datetime.now(timezone.utc)
-    lines = []
-    for r in results or []:
-        content = _clean(r.get("content", ""))
-        if content:
-            date = _render._date_label(r.get("created_at"), now)
-            lines.append((date is not None, "- " + (f"[{date}] " if date else "") + content))
-    if not lines:
-        return None
-    return f"=== {_BANNER} ===\n" + "\n".join(_render.undated_first(lines)) + f"\n=== {_BANNER} ==="
+    return _render.fenced_block(results, _BANNER, "join_lines", now=now, tool=_shim.TOOL,
+                                budget=budget)
 
 
 def _prompt_from(payload: dict) -> str:
@@ -120,7 +114,7 @@ def _log_fired(prompt: str, res, block, session) -> None:
                         f"injected={bool(block)} q_sha={q_sha} conv={session or ''}")
 
 
-_DEGRADED_TEXT = ("Atlaso · cloud recall isn't responding — memory is running from this device's local cache "
+_DEGRADED_TEXT = ("Atlaso · cloud recall isn't responding: memory is running from this device's local cache "
                   "(results may be shallower). Capture and sync are unaffected; this clears on its own once the service responds.")
 
 

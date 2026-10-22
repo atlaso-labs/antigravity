@@ -162,9 +162,9 @@ def _save_device_token(client: Any, base: str, code: str, verifier: str,
         log(f"\n  Connected as {uid}. Saved to {p}")
         return 0
     if status == "denied":
-        log("\n  Authorization could not be verified — reconnect to try again.")
+        log("\n  Authorization could not be verified: reconnect to try again.")
         return 1
-    log("\n  That link expired — reconnect to try again.")
+    log("\n  That link expired: reconnect to try again.")
     return 1
 
 
@@ -245,7 +245,7 @@ def connect(server: str | None = None, *, open_browser: bool = True,
                 except Exception:
                     pass
             log("")
-            log("  Atlaso — authorize this device:")
+            log("  Atlaso: authorize this device:")
             log(f"      {verify_url}")
             log("  (We tried to open it in your browser.) Waiting for approval…")
 
@@ -256,7 +256,7 @@ def connect(server: str | None = None, *, open_browser: bool = True,
                 httpd.handle_request()  # one request per loop (favicon etc. just 400)
             code = result.get("code")
             if not code:
-                log("\n  Timed out waiting for approval — check the authorization page, then run the connect command again.")
+                log("\n  Timed out waiting for approval: check the authorization page, then run the connect command again.")
                 return 1
 
             return _save_device_token(client, base, code, verifier, log)

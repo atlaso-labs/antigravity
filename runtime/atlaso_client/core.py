@@ -24,7 +24,7 @@ from typing import Any, Optional
 import httpx
 
 from . import _credential, _telemetry, config, state
-from .api import AuthRejected, BrainAPI, EdgeBlocked, NotEntitled
+from .api import AuthRejected, BrainAPI, EdgeBlocked, ForgetPending, NotEntitled
 from .cache import LONG_MAINTENANCE_S, Cache
 
 # Sentinel for capture(project=…): distinguishes "caller didn't say — derive
@@ -527,7 +527,7 @@ class Client:
             "results": results,
             "is_confident": None,
             "has_disagreement": None,
-            "verdict": "offline — local keyword match only",
+            "verdict": "offline: local keyword match only",
         }
 
     def forget(self, deposit_id: str) -> bool:
@@ -543,11 +543,21 @@ class Client:
         {"forgotten": bool, "local_cache_cleanup": "done" | "pending" | None}.
         'pending' is not a failed forget: the memory is already gone from recall
         and export; another process's open read snapshot keeps its bytes in the
-        file a little longer, and the next forget, sync or open removes them."""
+        file a little longer, and the next forget, sync or open removes them.
+
+        One failure is distinct and retryable: the brain answered 503 forget_pending
+        (it RECORDED the forget but has not finished removing the memory). Then the
+        result also carries "forget_pending": True and "retry_after_s" (seconds, or
+        None), the local row is kept (it may still be recalled until the forget
+        finishes), and calling forget again with the same id finishes it. Every other
+        failure (offline, timeout, other errors) has neither key."""
         if not self._online():
             return {"forgotten": False, "local_cache_cleanup": None}
         try:
             self.api.delete(deposit_id)
+        except ForgetPending as e:
+            return {"forgotten": False, "local_cache_cleanup": None,
+                    "forget_pending": True, "retry_after_s": e.retry_after_s}
         except Exception as e:
             self._note_auth_failure(e)
             return {"forgotten": False, "local_cache_cleanup": None}
@@ -624,13 +634,32 @@ class Client:
             valid = (isinstance(res, dict) and res.get("scope_version") == 1
                      and "project" in res and res["project"] == key
                      and res.get("tool") == self.tool)
-            block = res.get("block") if valid else None
+            # Only a server that scrubs each note whole before clipping attests it
+            # (brief_scrub). An older server clipped first, so its brief can end in a
+            # credential prefix no pattern recognizes: it is neither delivered nor
+            # cached, and the save below erases this snapshot.
+            scrub = res.get("brief_scrub") if valid else None
+            block = res.get("block") if valid and _ambient.attested(scrub) else None
             block = block if isinstance(block, str) and block.strip() else None
+            # The brief quotes the user's own notes, so a stored credential is redacted
+            # here as well as on the server (each layer holds on its own); text without
+            # one keeps its bytes. Redacted before the size check and the snapshot save.
+            if block is not None:
+                from ._render import redact_text
+                block = redact_text(block)
+            # The brief is one structured block; a host cuts anything over its hook cap
+            # (Claude Code shows a 2,000-character preview), so a brief over this tool's
+            # injection budget is not delivered at all (the server caps it at 1,600
+            # characters, so this only guards against a misbehaving server).
+            if block is not None:
+                from . import _inject
+                if _inject.size(block) > _inject.budget_for(self.tool):
+                    block = None
             if self._ambient_identity() != ident:
                 return None
             # Definitive denial, disabled setting, and incompatible servers all
             # erase this snapshot. Network errors never turn into cached delivery.
-            _ambient.save(self.tool, ident, block, project=key)
+            _ambient.save(self.tool, ident, block, project=key, scrub=scrub)
             return block
         except Exception as e:
             self._note_auth_failure(e)
@@ -678,13 +707,19 @@ class Client:
                 gaps = body.get("gaps")
                 complete = body.get("complete")
                 block = body.get("block")
-                if (isinstance(state, str) and state in {"ok", "empty", "withheld", "degraded"}
+                # A brief from a server without the scrub attestation is not delivered
+                # (see ambient()); with no text there is nothing to attest.
+                from . import _ambient
+                if block is not None and not _ambient.attested(body.get("brief_scrub")):
+                    result.update(state="degraded", reason="upstream")
+                elif (isinstance(state, str) and state in {"ok", "empty", "withheld", "degraded"}
                         and (reason is None or isinstance(reason, str))
                         and isinstance(gaps, list) and all(isinstance(gap, str) for gap in gaps)
                         and isinstance(complete, bool)
                         and (block is None or isinstance(block, str))):
+                    from ._render import redact_text
                     result.update(state=state, reason=reason, complete=complete,
-                                  gaps=gaps, block=block)
+                                  gaps=gaps, block=redact_text(block))
                 else:
                     result.update(state="degraded", reason="upstream")
             else:
@@ -717,7 +752,15 @@ class Client:
         if self.cloud_mode().get("mode") == state.LOCAL_ONLY:
             _ambient.save(self.tool, ident, None, project=key)
             return None
-        return _ambient.load(self.tool, ident, project=key)
+        block, legacy = _ambient.load_status(self.tool, ident, project=key)
+        if legacy:
+            # Saved before the server attested its scrub: the file is already deleted
+            # (an old clip can hold a key fragment no pattern recognizes). Fetch a
+            # fresh brief from the server instead; on any failure deliver nothing.
+            return self.ambient(project=key)
+        # Each layer holds on its own: redact on the way out as well.
+        from ._render import redact_text
+        return redact_text(block)
 
     def refresh_ambient(self, *, project=_PROJECT_UNSET,
                         project_dir: str | None = None) -> None:

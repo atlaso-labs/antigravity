@@ -8,9 +8,9 @@ legacy engine plugin so the thin connectors keep the same capture quality.
 """
 from __future__ import annotations
 
-import math
 import re
-from collections import Counter
+
+from . import _scrub as _server_scrub
 
 # ── worth-keeping gate ───────────────────────────────────────────────────────
 _CHATTER = re.compile(
@@ -114,60 +114,54 @@ def classify_scope(user_text: str) -> str:
 
 
 # ── secret scrub (defense-in-depth; the server re-scrubs too) ────────────────
-_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
-    ("private_key", re.compile(
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL)),
-    ("openai_anthropic_key", re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b")),
-    ("github_token", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}\b")),
-    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
-    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
-    ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
-    # credentialed URIs: postgres://user:pass@host, redis://:pass@host, etc. —
-    # mask only the password in the userinfo, keep the rest of the URL readable.
-    ("uri_credential", re.compile(r"\b([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@]*):([^\s/@]+)@")),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")),
-    ("bearer", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{16,}")),
-    ("assignment", re.compile(
-        r"(?i)\b([A-Za-z0-9_]*(?:api[_-]?key|secret|token|password|passwd|pwd|"
-        r"access[_-]?key|client[_-]?secret|auth[_-]?token)[A-Za-z0-9_]*)"
-        r"\s*[:=]\s*[\"']?([^\s\"']{6,})[\"']?")),
-]
-_BLOB = re.compile(r"\b[A-Za-z0-9+/=_-]{32,}\b")
-_ENTROPY_THRESHOLD = 4.2
-
-
-def _entropy(s: str) -> float:
-    if not s:
-        return 0.0
-    n = len(s)
-    return -sum((c / n) * math.log2(c / n) for c in Counter(s).values())
+# The detection set is the SERVER's: ``_scrub`` is a byte-identical copy of the brain's
+# pre-deposit scrubber (atlaso/platform/sdk/src/atlaso/recall/scrub.py), because the
+# connectors may not import the server-internal package (memo 16). A connector that
+# knows fewer shapes than the server leaves prose passwords, PINs, glpat-, short
+# Stripe, whsec_, 48+ hex and value-first credentials verbatim in the local cache and
+# in offline recall (CodeRedTeam c2d2ddcc F1). Drift is a test failure, not a review
+# item: server/test_scrub_connector_parity.py compares the bytes of this copy and runs
+# the server scrubber, this module and both TypeScript ports (tools/cursor,
+# tools/opencode lib/scrub.ts) over client/tests/fixtures/scrub_parity.json plus a
+# seeded fuzz, failing on any difference in what is redacted.
+#
+# One connector-only rule runs AFTER the server pass: when the text holds a QUOTED
+# assignment value with spaces, any part of it the server left after `NAME=[REDACTED]`,
+# up to the next quote, is masked too. The server masks a quoted or passphrase value
+# whole since BackendEngineer bb9ce163, so this now fires only where the server's quote
+# reading differs (an unterminated quote whose value the server leaves to a later label;
+# 247 of 24,091 fixture+fuzz inputs at bb9ce163). It keeps the rule the TypeScript
+# connectors already had. Because it runs on the server's output and only
+# removes more text, connector redaction is a superset of the server's by construction
+# (a pre-pass could hide a label from the server and redact LESS). Scrub ``text`` only,
+# never tags: the server's high-entropy catch-all damages long project keys (field
+# 6428f626), so a project key must not pass through here.
+_ASSIGN_NAME = (r"[A-Za-z0-9_]*(?:api[_-]?key|secret|token|password|passwd|pwd|"
+                r"access[_-]?key|client[_-]?secret|auth[_-]?token)[A-Za-z0-9_]*")
+_QUOTED_MULTIWORD_ASSIGNMENT = re.compile(
+    rf"(?i)\b({_ASSIGN_NAME})\s*[:=]\s*(?:\"(?=[^\"\n]*\s)[^\"\n]{{2,256}}\"|'(?=[^'\n]*\s)[^'\n]{{2,256}}')")
+_QUOTED_TAIL = re.compile(rf"(?i)\b({_ASSIGN_NAME})=\[REDACTED\](?=[^\"'\n]*\s)[^\"'\n]{{1,256}}[\"']")
+_ENTROPY_THRESHOLD = _server_scrub._ENTROPY_THRESHOLD
+_entropy = _server_scrub._entropy
 
 
 def scrub(text: str) -> tuple[str, list[str]]:
+    """Return ``(scrubbed_text, kinds_redacted)``: the server scrubber's result, then the
+    connector-only quoted-tail rule. Credentials are replaced in place with the server's
+    markers (``[REDACTED:<kind>]``, ``NAME=[REDACTED]``, ``[REDACTED]``). When nothing is
+    found the ORIGINAL object is returned unchanged (the server scrubber would return its
+    NFC form; a clean note keeps its exact bytes here)."""
     if not text:
         return text, []
-    found: list[str] = []
-    out = text
-    for kind, pat in _PATTERNS:
-        def _repl(m: "re.Match[str]", _kind: str = kind) -> str:
-            found.append(_kind)
-            if _kind == "assignment" and m.lastindex and m.lastindex >= 2:
-                return f"{m.group(1)}=[REDACTED]"
-            if _kind == "uri_credential":
-                return f"{m.group(1)}:[REDACTED]@"  # keep scheme+user+host, mask pass
-            return f"[REDACTED:{_kind}]"
-        out = pat.sub(_repl, out)
-
-    def _blob_repl(m: "re.Match[str]") -> str:
-        tok = m.group(0)
-        if "REDACTED" in tok:
-            return tok
-        if _entropy(tok) >= _ENTROPY_THRESHOLD:
-            found.append("high_entropy")
-            return "[REDACTED:high_entropy]"
-        return tok
-    out = _BLOB.sub(_blob_repl, out)
-    return out, found
+    out, found = _server_scrub.scrub(text)
+    if _QUOTED_MULTIWORD_ASSIGNMENT.search(text):
+        # (a) the server masked the first word: mask the rest of the quoted value
+        out, n_tail = _QUOTED_TAIL.subn(lambda m: f"{m.group(1)}=[REDACTED]", out)
+        # (b) the server left the quoted value whole (a stopword first, or `api_key`
+        # where `key` has no word boundary): mask all of it
+        out, n_whole = _QUOTED_MULTIWORD_ASSIGNMENT.subn(lambda m: f"{m.group(1)}=[REDACTED]", out)
+        found = found + ["assignment"] * (n_tail + n_whole)
+    return (out, found) if found else (text, [])
 
 
 # ── near-duplicate check ─────────────────────────────────────────────────────

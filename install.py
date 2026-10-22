@@ -93,7 +93,7 @@ def resolve_bundle_source() -> Path:
     # (re)build from the dev tree so the bundle is always fresh + complete
     pkg = HERE / "package.py"
     if not pkg.exists():
-        sys.exit(f"atlaso: no built bundle and no package.py at {pkg} — cannot install.")
+        sys.exit(f"atlaso: no built bundle and no package.py at {pkg}: cannot install.")
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("atlaso_package", pkg)
@@ -180,12 +180,12 @@ def install(dry: bool) -> None:
         # success. Fail loudly so the real error surfaces.
         detail = (r.stderr or r.stdout).strip()
         last = detail.splitlines()[-1] if detail else "unknown error"
-        sys.exit(f"atlaso: `agy plugin install` failed — {last}\n"
+        sys.exit(f"atlaso: `agy plugin install` failed: {last}\n"
                  f"       (the plugin was NOT installed; fix the above and re-run)")
 
     # No `agy` on PATH → file-drop the bundle (the Antigravity IDE may pick it up, but the
     # agy CLI won't load an unregistered plugin — install `agy` and re-run for CLI support).
-    print("  ! `agy` not on PATH — writing a file-drop (Antigravity IDE only; the agy CLI "
+    print("  ! `agy` not on PATH: writing a file-drop (Antigravity IDE only; the agy CLI "
           "won't load it until you install `agy` and re-run)")
     if dry:
         print(f"  [dry-run] would replace {dst}")
@@ -231,7 +231,7 @@ def uninstall(dry: bool) -> None:
         print(f"  ✗ unregistered via agy + removed {dst}")
         return
     if not dst.exists():
-        print(f"  no plugin at {dst} — nothing to remove")
+        print(f"  no plugin at {dst}: nothing to remove")
         return
     if dry:
         print(f"  [dry-run] would remove {dst}")
@@ -254,7 +254,7 @@ def main() -> None:
     ap.add_argument("--uninstall", action="store_true")
     args = ap.parse_args()
 
-    print(f"Atlaso × Antigravity — plugin dir: {install_dir()}")
+    print(f"Atlaso × Antigravity: plugin dir: {install_dir()}")
     if args.uninstall:
         uninstall(args.dry_run)
         return

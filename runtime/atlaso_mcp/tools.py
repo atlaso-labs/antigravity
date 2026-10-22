@@ -11,12 +11,15 @@ tools never assume that — they work the same whether or not auto-surfacing exi
 """
 from __future__ import annotations
 
+import os
+
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from atlaso_client import _project
+from atlaso_client._render import redact_text
 
 from .ambient_tool_core import PATH_SHAPE, auth_notice, normalize_remote, shape_ambient, valid_project_key
 
@@ -61,17 +64,19 @@ def do_ambient(client, project: str | None = None) -> dict[str, Any]:
         return shape_ambient(429, None, None, match, key)
     if state == "degraded" and reason in {"timeout", "upstream"}:
         return shape_ambient(reason, None, None, match, key)
-    body = {**wire, "scope_version": 1}
+    # The brief quotes stored notes: redact a stored credential here too, whatever the
+    # client in front of this tool already did (each layer holds on its own).
+    body = {**wire, "block": redact_text(wire.get("block")), "scope_version": 1}
     return shape_ambient(200, body, None, match, key)
 
 # The lab's polarity guide — surfaced VERBATIM in the tool description so the
 # model picks the right bucket (see server.py + server/mcp_app.py wrappers).
 POLARITY_GUIDE = (
-    "polarity (required) — which bucket this memory belongs to:\n"
-    '  · positive — "an affirmed preference, adopted tool, active decision, or standing fact"\n'
-    '  · open — "genuinely tentative/undecided"\n'
-    '  · cautionary — "avoid / known footgun / works-but-with-caveats"\n'
-    '  · negative — "rejected, disliked, deprecated"'
+    "polarity (required): which bucket this memory belongs to:\n"
+    '  · positive: "an affirmed preference, adopted tool, active decision, or standing fact"\n'
+    '  · open: "genuinely tentative/undecided"\n'
+    '  · cautionary: "avoid / known footgun / works-but-with-caveats"\n'
+    '  · negative: "rejected, disliked, deprecated"'
 )
 
 
@@ -101,13 +106,40 @@ def stated_on(value: object) -> str | None:
     return dt.astimezone(timezone.utc).date().isoformat()
 
 
+def _recall_project() -> str | None:
+    """The project this MCP server recalls for: ONLY the launcher's explicit
+    ATLASO_CALLER_PWD (the host's working directory), resolved exactly as the prompt hook
+    and capture resolve it. Absent, empty, relative, nonexistent or otherwise unmeasurable
+    means None (personal-only). The MCP server's own process working directory is never
+    consulted: it is wherever the host happened to spawn the server, so it can name a
+    project the caller is not in (SecurityEngineer 4c26fd7d finding 1). The brain's
+    visibility rule stays the only authority on what is shown; this key can only select
+    the caller's own project, never widen past it.
+    ATLASO_MCP_RECALL_PROJECT=0 restores the old personal-only MCP recall (rollback)."""
+    if os.environ.get("ATLASO_MCP_RECALL_PROJECT", "1").strip().lower() in ("0", "false", "off", "no", ""):
+        return None
+    caller = os.environ.get("ATLASO_CALLER_PWD")
+    if not caller or not caller.strip():
+        return None
+    try:
+        # An explicit start: _project returns None for a relative or nonexistent path and
+        # never falls back to Path.cwd() when given one.
+        return _project.project_key(Path(caller))
+    except Exception:  # noqa: BLE001 - an unmeasurable caller directory is personal-only, never an error
+        return None
+
+
 def do_recall(client, query: str, limit: int = 5) -> dict[str, Any]:
-    res = client.recall(query, limit=limit)
+    # Task 1b7cb9b7: MCP recall used to send no project, so the brain hid every
+    # project-scoped note from it while the prompt hook (same notes, same user) saw them.
+    res = client.recall(query, limit=limit, project=_recall_project())
     # The offline (source "local") path carries no created_at (atlaso_client drops the
     # cache's insertion time), so those results come back with stated_on null.
+    # Every note text is credential-redacted in place (redact_text: the hooks' scrub and
+    # markers, no other byte changed); a note is never dropped and its id is unchanged.
     return {
         "results": [
-            {"id": r.get("id"), "content": r.get("content"),
+            {"id": r.get("id"), "content": redact_text(r.get("content")),
              "stated_on": stated_on(r.get("created_at"))}
             for r in res.get("results", [])
         ],
@@ -172,6 +204,18 @@ FORGET_SCOPE_DISCLOSURE = " ".join(
 DONE_CLEANUP_NOTE = FORGET_RECALL_SCOPE + " " + FORGET_INFLIGHT_DISCLOSURE
 
 
+# The brain RECORDED the forget but has not finished removing the memory (503
+# forget_pending, a retryable result; DXCritic 9a199bc2). Plain words, no em dashes.
+# The hosted MCP (server/mcp_app.py) and the Cursor and OpenCode connectors carry the
+# same sentence; their tests pin it byte for byte.
+FORGET_PENDING_NOTE = (
+    "Atlaso recorded this forget but has not finished removing the memory yet, so it "
+    "may still be recalled for now. Wait a few seconds, then retry the same forget to "
+    "finish it. Retrying is safe."
+)
+FORGET_OFFLINE_NOTE = "Not forgotten: the server was unreachable (offline). Try again when connected."
+
+
 def do_forget(client, id: str) -> dict[str, Any]:
     detail = getattr(client, "forget_detail", None)
     res = detail(id) if callable(detail) else {"forgotten": client.forget(id)}
@@ -184,20 +228,21 @@ def do_forget(client, id: str) -> dict[str, Any]:
         elif res.get("local_cache_cleanup") == "done":
             out["note"] = DONE_CLEANUP_NOTE
         return out
-    return {
-        "forgotten": False,
-        "id": id,
-        "note": "not forgotten — the server was unreachable (offline). Try again when connected.",
-    }
+    if res.get("forget_pending"):
+        return {"forgotten": False, "id": id, "forget_pending": True, "retryable": True,
+                "note": FORGET_PENDING_NOTE}
+    return {"forgotten": False, "id": id, "note": FORGET_OFFLINE_NOTE}
 
 
 def do_recent(client, limit: int = 10) -> dict[str, Any]:
     """Latest memories, each dated by ``stated_on`` from the brain's ``stated_at``.
     The row's ``created_at`` is its INSERTION time (an L2 rewrite's rewrite day, an
-    import's import day), not when the user said it, so it is never passed on."""
+    import's import day), not when the user said it, so it is never passed on. The note
+    text is credential-redacted in place, as in do_recall."""
     rows = client.recent(limit=limit)
     return {"memories": [
         {**{k: v for k, v in r.items() if k not in ("created_at", "stated_at")},
+         **({"content": redact_text(r["content"])} if "content" in r else {}),
          "stated_on": stated_on(r.get("stated_at"))}
         for r in rows if isinstance(r, dict)
     ]}
