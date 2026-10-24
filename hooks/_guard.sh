@@ -28,8 +28,9 @@
 #     ids, paths or payloads.
 #   - Every hook exits 0: memory is best-effort, the user's turn is not.
 #
-# Portable to bash 3.2 (stock macOS), Linux and Git Bash: no `timeout`, no `setsid`, no
-# fractional `read -t`.
+# Portable to bash 3.2 (stock macOS), Linux and Git Bash: no `timeout`, no fractional
+# `read -t`, and nothing that must exist beyond POSIX tools: the update nudge uses `setsid` or
+# perl only when present, with a plain HUP-ignoring start as the fallback.
 #
 # Needs from the sourcing script: ATLASO_GUARD_ROOT = the plugin/tool dir holding runtime/.
 
@@ -432,4 +433,47 @@ atlaso_capture() {
 # bounded by the session-start budget.
 atlaso_run() {
   atlaso_fg "${ATLASO_TOOL:-unknown}" run "$ATLASO_START_BUDGET" "$1"
+}
+
+# atlaso_update_nudge: start the Atlaso CLI's daily self-update check, never wait for it.
+# Costs a `find` or two on small files when no check is due. The CLI does the network work itself
+# (`atlaso update --auto`), fully detached: no stdin, stdout or stderr is shared with this hook,
+# so the host never waits on it and an offline or rate-limited GitHub cannot slow the session.
+# Detached means its OWN SESSION too (CRT-AU-2): a host that runs hooks in its process group,
+# and a terminal that closes, send SIGHUP to that group, and a check killed half way through a
+# plugin refresh is exactly what must not happen. `setsid` where it exists (Linux, Git Bash),
+# else perl's POSIX::setsid (macOS ships perl, not setsid), else HUP ignored as the last resort.
+# The CLI's --auto path also ignores HUP itself.
+# At most one start a day even for a CLI too old to know `update` (it never writes state.json):
+# the hook's own `nudged` stamp is touched before the start. Off when ATLASO_NO_AUTO_UPDATE is
+# set or after `atlaso update --off`.
+_atlaso_fresh() { [ -f "$1" ] && [ -z "$(find "$1" -mmin +1440 2>/dev/null)" ]; }
+atlaso_update_nudge() {
+  case "${ATLASO_NO_AUTO_UPDATE:-}" in ""|0|false|FALSE|False) ;; *) return 0 ;; esac
+  local home bin
+  home="${ATLASO_HOME:-$HOME/.atlaso}"
+  [ -f "$home/update/off" ] && return 0
+  bin="$home/bin/atlaso"
+  [ -x "$bin" ] || bin="$home/bin/atlaso.exe"
+  [ -x "$bin" ] || return 0
+  _atlaso_fresh "$home/update/state.json" && return 0
+  _atlaso_fresh "$home/update/nudged" && return 0
+  ( umask 077; mkdir -p "$home/update" && : >"$home/update/nudged" ) 2>/dev/null || return 0
+  _atlaso_detach "$bin" update --auto
+  return 0
+}
+
+# _atlaso_detach <cmd...>: run cmd in a new session, stdio on /dev/null, without waiting.
+_atlaso_detach() {
+  (
+    trap '' HUP
+    if command -v setsid >/dev/null 2>&1; then
+      exec setsid "$@"
+    elif command -v perl >/dev/null 2>&1; then
+      exec perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or exit 127' "$@"
+    else
+      exec "$@"
+    fi
+  ) </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
 }
