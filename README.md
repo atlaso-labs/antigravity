@@ -3,6 +3,9 @@
 **Automatic long-term memory for Google Antigravity** — recall before each turn
 and capture after, in both the IDE and the `agy` CLI, via one native plugin.
 
+## Why this exists
+Antigravity has an IDE and a CLI. One install adds automatic recall and capture to both, keeps long-running task context and your conventions, and shares one memory with every other tool you use. [How it works](https://www.atlaso.ai/for/antigravity) · [Docs](https://docs.atlaso.ai/tools/antigravity)
+
 ## Install
 
 You need Antigravity's `agy` CLI on your PATH first (the Atlaso CLI installs the
