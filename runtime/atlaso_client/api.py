@@ -11,6 +11,8 @@ from typing import Any
 
 import httpx
 
+from . import _timing
+
 
 class AuthRejected(Exception):
     """OUR app verifiably rejected the credential (401/403 carrying the Atlaso
@@ -68,7 +70,11 @@ def _retry_after_s(r: httpx.Response) -> float | None:
 
 # State-transition codes the client acts on. Anything else on a verified 401/403
 # (an unknown future code) fails SAFE: treated as transient, item stays queued.
-_AUTH_CODES = ("invalid_token", "reconnect_required")
+# credential_revoked: the data plane's verdict for a tool the user removed from this device
+# (server require_tool_access). /v1/entitlement answers the same token with 401 invalid_token,
+# so both routes now park the tool the same way (recall r5: recall no longer always asks
+# /v1/entitlement first).
+_AUTH_CODES = ("invalid_token", "reconnect_required", "credential_revoked")
 
 
 def _raise(r: httpx.Response) -> None:
@@ -121,7 +127,12 @@ class BrainAPI:
 
     def recall(self, query: str, limit: int = 5, project: str | None = None,
                session: str | None = None, *, surface: str | None = None,
-               prev_event: str | None = None) -> dict[str, Any]:
+               prev_event: str | None = None, want_entitlement: bool = False) -> dict[str, Any]:
+        """`want_entitlement` asks the brain to attach this device's tool policy (the
+        /v1/entitlement body) as `entitlement` (recall r5), so a client whose LINKED verdict
+        went stale re-verifies on the recall itself instead of in a separate round trip. The
+        brain's tool gate still decides whether this request is served at all. An older brain
+        ignores the header and returns no `entitlement` key."""
         params: dict[str, Any] = {"q": query, "limit": limit}
         if project:
             params["project"] = project  # per-project scope filter
@@ -139,7 +150,10 @@ class BrainAPI:
             headers["X-Atlaso-Recall-Context"] = f"surface={surface};client={_cv}"
         if prev_event:
             headers["X-Atlaso-Recall-Prev"] = prev_event
-        r = self._client.get("/v1/recall", params=params, headers=headers or None)
+        if want_entitlement:
+            headers["X-Atlaso-Entitlement"] = "1"
+        r = self._client.get("/v1/recall", params=params, headers=headers or None,
+                             **_timing.http_kwargs("recall"))
         _raise(r)
         out = r.json()
         eid = r.headers.get("X-Atlaso-Recall-Event")
@@ -248,7 +262,7 @@ class BrainAPI:
     def entitlement(self) -> dict[str, Any]:
         """This device's tool policy: {device_id, active_tool, multi_tool,
         needs_reconnect}. Device-authed (the bearer token identifies the device)."""
-        r = self._client.post("/v1/entitlement")
+        r = self._client.post("/v1/entitlement", **_timing.http_kwargs("ent"))
         _raise(r)
         return r.json()
 

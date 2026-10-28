@@ -18,12 +18,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 import uuid
 from typing import Any, Optional
 
 import httpx
 
-from . import _credential, _telemetry, config, state
+from . import _credential, _telemetry, _timing, config, state
 from .api import AuthRejected, BrainAPI, EdgeBlocked, ForgetPending, NotEntitled
 from .cache import LONG_MAINTENANCE_S, Cache
 
@@ -46,6 +47,11 @@ _STATS_DAYS = 35
 # when the new text adopts the old value. revert_of/supersedes are hints only until
 # Card A ships.
 _ROUTE_HINTS = ("update_of", "revert_of", "supersedes")
+
+
+def _stale_linked_on() -> bool:
+    """ATLASO_RECALL_STALE_LINKED (default on; 0/off/false restores verify-then-recall)."""
+    return os.environ.get("ATLASO_RECALL_STALE_LINKED", "1").strip().lower() not in ("0", "off", "false", "no")
 
 
 def _route_hints(related: dict[str, Any]) -> dict[str, Any]:
@@ -73,6 +79,7 @@ class Client:
         tool: str | None = None,
         _auto_api: bool = True,
     ):
+        _t_init = time.monotonic()
         self.cache = cache or Cache(cache_path or config.cache_path())
         # The connector that owns this client (e.g. "claude-code"). Used for plan
         # entitlement: on free, only the device's ACTIVE tool is cloud-linked; the
@@ -96,6 +103,7 @@ class Client:
             self.api = self._resolve_api(server, token)
         else:
             self.api = None
+        _timing.add("client", (time.monotonic() - _t_init) * 1000)
 
     def _resolve_api(self, server: str | None, token: str | None) -> Optional[BrainAPI]:
         if server and token:  # explicit override (tests / embedding)
@@ -230,6 +238,16 @@ class Client:
             # doesn't gate by tool). Stay local this turn, leave state unchanged →
             # retry verification next time.
             return False
+        return self._apply_entitlement(ent, allow_claim=True)
+
+    def _apply_entitlement(self, ent: dict, *, allow_claim: bool) -> bool:
+        """Persist the verdict an entitlement body carries (from /v1/entitlement, or the copy
+        /v1/recall attaches on request) and return True when this tool is cloud-linked.
+        `allow_claim=False` (the recall copy): a free device with no active tool yet is not
+        claimed here; the verdict is dropped so the next run verifies in full and claims."""
+        tool, did = self.tool, self._device_id
+        if not isinstance(ent, dict):
+            return False
         if ent.get("needs_reconnect"):
             state.set_local_only(state.RECONNECT_REQUIRED, tool=tool, device_id=did)
             return False
@@ -244,6 +262,9 @@ class Client:
             state.set_linked(tool=tool, device_id=did, grace=grace)
             return True
         active = ent.get("active_tool")
+        if active is None and not allow_claim:
+            state.invalidate()
+            return False
         if active is None:
             # No tool has claimed the (free) active slot yet — the first tool
             # self-activates instead of failing into local-only.
@@ -445,17 +466,54 @@ class Client:
         return out
 
     # ── read ─────────────────────────────────────────────────────────────────
+    def _recall_route(self) -> str:
+        """How recall reaches the brain (recall r5). "go": a fresh LINKED verdict for this
+        identity. "go_verify": this identity's LAST verdict was LINKED but is now stale, so the
+        recall goes out at once and asks the brain to attach the current tool policy, which is
+        applied before any result is used (one round trip instead of /v1/entitlement then
+        /v1/recall). "local": no cloud call, the local floor answers. A LOCAL-ONLY verdict
+        (revoked, not entitled, reconnect required), an absent or foreign verdict, or a
+        verdict never verified (checked_at 0) never takes the fast route: those go through
+        _online(), which verifies with /v1/entitlement first or stays local without touching
+        the network. ATLASO_RECALL_STALE_LINKED=0 restores the old order everywhere. The brain
+        enforces the plan rule on /v1/recall itself (require_tool_access), whichever route."""
+        if self.api is None:
+            return "local"
+        try:
+            st = state.get()
+            if (_stale_linked_on() and st.get("mode") == state.LINKED
+                    and state.matches(st, self.tool, self._device_id)
+                    and int(st.get("checked_at") or 0) > 0 and not state.is_fresh(st)):
+                return "go_verify"
+        except Exception:
+            return "local"
+        return "go" if self._online() else "local"
+
     def _server_recall(self, query: str, limit: int, project: str | None,
                        session: str | None) -> dict | None:
         """The brain half of recall(): the answer, or None to use the local floor. Touches no
         SQLite connection, so recall() may abandon it on a thread past its budget."""
-        if not self._online():
+        route = self._recall_route()
+        if route == "local":
+            _timing.note("net_end", "local_only")
             return None
         try:
             from . import _retrieval_echo
             res = self.api.recall(query, limit, project=project, session=session,
                                   surface="hook_recall",
-                                  prev_event=_retrieval_echo.take_pending())
+                                  prev_event=_retrieval_echo.take_pending(),
+                                  **({"want_entitlement": True} if route == "go_verify" else {}))
+            ent = res.pop("entitlement", None) if isinstance(res, dict) else None
+            if route == "go_verify" and ent is not None and not self._apply_entitlement(
+                    ent, allow_claim=False):
+                # The brain says this tool is no longer cloud-linked (another tool took the free
+                # slot, the device must reconnect): never use these results. The new verdict is
+                # stored, so the next prompt stays local without a request.
+                _timing.note("net_end", "local_only")
+                return None
+            # No `entitlement` in the answer (an older brain): the brain's tool gate served this
+            # request, so the results are used; the stale verdict stays stale and the next stale
+            # recall asks again.
             res["source"] = "server"
             # retrieval_event echo: remember this event id so the NEXT
             # recall can settle block_emitted server-side (spec 3440342a §c).
@@ -467,6 +525,7 @@ class Client:
             return res
         except Exception as e:
             self._note_auth_failure(e)  # fall through to the local floor
+            _timing.note("net_end", "error")
             # Degradation is otherwise invisible (fail-open): count it so
             # the SessionStart notice can surface a persistent episode.
             from . import _fallback
@@ -495,26 +554,38 @@ class Client:
             done, res = False, None
             if network_budget > 0.05:
                 try:
-                    done, res = _deadline.call_within(
-                        lambda: self._server_recall(query, limit, project, session),
-                        network_budget)
+                    with _timing.span("net"):
+                        done, res = _deadline.call_within(
+                            lambda: self._server_recall(query, limit, project, session),
+                            network_budget)
                 except Exception:
                     done, res = True, None
+            else:
+                _timing.note("net_end", "no_time")
             if not done:
                 # Abandoned past its budget (or no time for a round trip at all): the local
                 # floor answers, and the skip is counted without any content.
                 res = None
+                _timing.note("net_end", "deadline")
                 _deadline.record(self.tool, "recall", "network_deadline")
                 from . import _fallback
                 _fallback.record_fallback()
         if res is not None:
+            _timing.note("net_end", "ok")
+            _timing.note("src", "server")
             return res
         try:
             # over-fetch then apply the SAME per-project visibility rule as the
             # server, so OFFLINE recall can't leak repo A's project memory into
             # repo B (Codex BLOCKER).
-            from . import _project
-            raw = self.cache.keyword_search(query, max(limit * 4, limit))
+            from . import _deadline, _project
+            _timing.note("src", "local")
+            with _timing.span("local"):
+                # Inside a hook the search stops at the hook's deadline (less the render
+                # reserve) and answers empty rather than outliving the hook (recall r5).
+                raw = self.cache.keyword_search(query, max(limit * 4, limit),
+                                                deadline=_deadline.local_deadline(),
+                                                recall_terms=True)
             # No created_at offline: the cache holds the server row's INSERTION
             # time, which for an L2 rewrite is not when the note was said, so the
             # renderer must show these lines undated (rung 85bcf262 repair).

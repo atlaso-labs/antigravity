@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import config
+from . import _timing, config
 
 #: The brain round trip inside a recall hook (entitlement check included). The rest of the
 #: 2.5 s hook budget is interpreter start-up, the local fallback and rendering.
@@ -38,6 +38,9 @@ NETWORK_BUDGET_S = 1.5
 _MARGIN_S = 0.3
 #: Kept back from the brain call for the local fallback, rendering and writing the output.
 _LOCAL_RESERVE_S = 0.35
+#: Kept back from the local fallback's search for rendering and writing the output (recall r5). Rendering local
+#: hits of long notes measured 96 ms p50 / 134 ms p95 on a synthetic founder-shaped cache (r5 G7).
+_RENDER_RESERVE_S = 0.15
 #: The monotonic time this process must be done by, set by run_hook(); None outside a hook.
 _DEADLINE: float | None = None
 _LOG_MAX_BYTES = 65536
@@ -112,6 +115,14 @@ def network_budget(default: float) -> float:
     return max(0.0, min(default, left))
 
 
+def local_deadline() -> float | None:
+    """The monotonic time the local fallback's search must stop by inside a hook (the hook deadline less the
+    render and write reserve), or None outside a hook (MCP tools and the CLI search to completion)."""
+    if _DEADLINE is None:
+        return None
+    return _DEADLINE - _RENDER_RESERVE_S
+
+
 def call_within(fn: Callable[[], Any], budget_s: float) -> tuple[bool, Any]:
     """Run ``fn`` in a daemon thread for at most ``budget_s``. Returns (True, result) when it
     finished, (False, None) when it did not. An exception inside ``fn`` is re-raised here.
@@ -146,6 +157,9 @@ def run_hook(main: Callable[[], Any], *, tool: str | None, event: str,
     _DEADLINE = min(now, started if started is not None else now) \
         + max(0.2, hook_budget(default_budget) - _MARGIN_S)
     budget = max(0.05, _DEADLINE - now)
+    if event == "recall":
+        # Content-free stage timing (recall r5): names and milliseconds only, see _timing.
+        _timing.begin(tool, event, started if started is not None else now)
     real = sys.stdout
     buf = io.StringIO()
     box: dict[str, Any] = {}
@@ -165,6 +179,7 @@ def run_hook(main: Callable[[], Any], *, tool: str | None, event: str,
         sys.stdout = real
     if t.is_alive():
         record(tool, event, "deadline")
+        _timing.flush("deadline")
         try:
             real.flush()
         finally:
@@ -174,6 +189,7 @@ def run_hook(main: Callable[[], Any], *, tool: str | None, event: str,
         real.flush()
     except Exception:
         pass
+    _timing.flush("ok")
     if any(th.daemon and th.is_alive() and th.name == "atlaso-bounded"
            for th in threading.enumerate()):
         # An abandoned brain call is still in flight. Do not let interpreter shutdown wait

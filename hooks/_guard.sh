@@ -299,6 +299,9 @@ _atlaso_not_ready_notice() {
 # notice where the host has one, and a detached warm-up.
 atlaso_fg() {
   local tool="$1" event="$2" budget="$3" mod="$4" out rc
+  # Wall-clock start of this hook for the module's content-free stage timing (recall r5): bash 5's
+  # EPOCHREALTIME, seconds with microseconds. Empty on bash 3.2, which then omits the boot stage.
+  export ATLASO_HOOK_T0="${EPOCHREALTIME:-}"
   _atlaso_prep
   _atlaso_resolve_py
   rc=$?

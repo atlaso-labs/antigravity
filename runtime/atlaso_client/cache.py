@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import time
@@ -265,6 +266,44 @@ def _fts_query(text: str) -> str:
     Returns '' if there's nothing searchable."""
     toks = _WORD_RE.findall(text or "")
     return " OR ".join(f'"{t}"' for t in toks) if toks else ""
+
+
+# The hook's offline floor (recall r5). Every token OR-joined, stopwords included, makes the
+# FTS5 match set nearly the whole cache and bm25 then scores every row: on a synthetic
+# founder-shaped cache (8,700 notes) a 40-word prompt took about 1 s and a 250-word one 23 s,
+# far past the hook's deadline. The recall floor therefore searches the prompt's distinct
+# content words only, at most _RECALL_MAX_TERMS of them (longest first: in English the
+# longer words are the rarer ones). ATLASO_LOCAL_RECALL_TERMS=all restores every token.
+_RECALL_MAX_TERMS = 16
+_STOPWORDS = frozenset("""
+a about above after again against all am an and any are as at be because been before being below between both
+but by can could did do does doing done down during each few for from further get got had has have having he her
+here hers herself him himself his how i if in into is it its itself just let lets me more most my myself no nor
+not now of off on once only or other our ours ourselves out over own please same she should so some such than
+that the their theirs them themselves then there these they this those through to too under until up us very was
+we were what when where which while who whom why will with would you your yours yourself yourselves
+""".split())
+
+
+def _fts_recall_query(text: str) -> str:
+    """The recall floor's MATCH expression: distinct lower-cased tokens, stopwords and single
+    characters dropped (all of them kept when nothing else is left), at most
+    _RECALL_MAX_TERMS (the longest, kept in prompt order), each quoted as in _fts_query."""
+    if os.environ.get("ATLASO_LOCAL_RECALL_TERMS", "").strip().lower() == "all":
+        return _fts_query(text)
+    seen: list[str] = []
+    have: set[str] = set()
+    for tok in _WORD_RE.findall(text or ""):
+        k = tok.lower()
+        if k not in have:
+            have.add(k)
+            seen.append(k)
+    keep = [t for t in seen if len(t) > 1 and t not in _STOPWORDS] or seen
+    if len(keep) > _RECALL_MAX_TERMS:
+        order = {t: i for i, t in enumerate(keep)}
+        longest = sorted(keep, key=lambda t: (-len(t), order[t]))[:_RECALL_MAX_TERMS]
+        keep = sorted(longest, key=order.__getitem__)
+    return " OR ".join(f'"{t}"' for t in keep) if keep else ""
 
 
 def _now_iso() -> str:
@@ -1054,17 +1093,34 @@ class Cache:
         self._conn.commit()
 
     # ── offline recall (commodity keyword search) ────────────────────────────
-    def keyword_search(self, query: str, limit: int = 5) -> list[dict]:
-        q = _fts_query(query)
+    def keyword_search(self, query: str, limit: int = 5, *, deadline: float | None = None,
+                       recall_terms: bool = False) -> list[dict]:
+        """Keyword hits in bm25 order. `recall_terms=True` (the hook's offline floor) searches the
+        prompt's content words only (_fts_recall_query). `deadline` (time.monotonic()): the query
+        is interrupted at that moment and the answer is [] instead of a late one (recall r5: a
+        hook killed at its deadline injects nothing either, and this way it still exits cleanly)."""
+        q = _fts_recall_query(query) if recall_terms else _fts_query(query)
         if not q:
             return []
-        rows = self._conn.execute(
-            "SELECT d.id, d.content, d.polarity, d.created_at, d.tags_json, d.pending "
-            "FROM cached_fts f JOIN cached_deposits d ON d.id = f.deposit_id "
-            "WHERE cached_fts MATCH ? AND d.retracted = 0 "
-            "ORDER BY bm25(cached_fts) LIMIT ?",
-            (q, limit),
-        ).fetchall()
+        if deadline is not None:
+            if time.monotonic() >= deadline:
+                return []
+            self._conn.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
+        try:
+            rows = self._conn.execute(
+                "SELECT d.id, d.content, d.polarity, d.created_at, d.tags_json, d.pending "
+                "FROM cached_fts f JOIN cached_deposits d ON d.id = f.deposit_id "
+                "WHERE cached_fts MATCH ? AND d.retracted = 0 "
+                "ORDER BY bm25(cached_fts) LIMIT ?",
+                (q, limit),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            if deadline is not None and "interrupt" in str(e).lower():
+                return []
+            raise
+        finally:
+            if deadline is not None:
+                self._conn.set_progress_handler(None, 0)
         out = []
         for r in rows:
             try:
