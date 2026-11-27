@@ -83,6 +83,11 @@ def save_auth(server: str, token: str, user_id: str, device_id: str | None,
         state.invalidate()
     except Exception:
         pass
+    try:  # a dead bearer's reconnect record is moot once a new one is saved
+        from . import _reconnect
+        _reconnect.clear()
+    except Exception:
+        pass
     return p
 
 
@@ -264,6 +269,15 @@ def connect(server: str | None = None, *, open_browser: bool = True,
         if e.response.headers.get("X-Atlaso-Error") == "reconnect_unproven":
             log("This saved connection could not be renewed. Check its entry in Atlaso Settings, then try again.")
             return 1
+        # Older backends can still return retired plan refusals; never save a token.
+        if e.response.headers.get("X-Atlaso-Error") in {
+            "not_entitled", "tool_switch_needed", "device_limit_reached",
+            "plan_unresolved", "entitlement_required",
+        }:
+            log("Atlaso is free on every tool and device, with no device or tool limit. "
+                "The server refused this connection using an older plan rule. "
+                "Try again; if it persists, contact support@atlaso.ai.")
+            return 1
         log(f"  Error: server returned {e.response.status_code} from {base}.")
         return 1
     except httpx.HTTPError as e:
@@ -301,9 +315,21 @@ def maybe_autoconnect(tool: str | None = None) -> bool:
     DETACHED connect (which opens the browser) and return True. No-op + False if
     already connected, opted out, in CI, or a connect is already in flight. Fast:
     never blocks, never touches the network itself. `tool` (e.g. "claude-code")
-    is propagated to the detached process so the authorize screen can name it."""
+    is propagated to the detached process so the authorize screen can name it.
+
+    A token on disk normally means "connected". The one exception
+    (ATLASO_RECONNECT_EXPIRED, default on): the server rejected that very token as the
+    shared bearer with invalid_token and it expired by itself: no accepted call for the token
+    life (last_ok_at), or, on an install that never recorded one, auth.json that old.
+    Then the same flow runs again (it sends the saved device id and reconnect proof, so
+    approving in the browser renews this device), at most once a day and MAX_TRIES times
+    per dead token, never for a tool the user removed (see _reconnect)."""
+    reconnect = False
     if has_token():
-        return False
+        from . import _reconnect
+        if not _reconnect.due(tool):
+            return False
+        reconnect = True
     if os.environ.get("ATLASO_NO_CONNECT") or os.environ.get("ATLASO_EXTRACTING"):
         return False
     if os.environ.get("CI"):
@@ -325,6 +351,20 @@ def maybe_autoconnect(tool: str | None = None) -> bool:
     child_env = os.environ.copy()
     if tool:
         child_env["ATLASO_TOOL"] = tool  # detached connect reads this for /device/start
+    if reconnect:
+        # S6: count the attempt BEFORE the browser flow starts; no durable record, no flow
+        from . import _reconnect
+        if not _reconnect.note_spawned():
+            if log_f is not subprocess.DEVNULL:
+                try:
+                    log_f.close()
+                except OSError:
+                    pass
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+            return False
     try:
         subprocess.Popen(
             [sys.executable, "-m", "atlaso_client.connect"],
@@ -332,6 +372,9 @@ def maybe_autoconnect(tool: str | None = None) -> bool:
             env=child_env,
             start_new_session=True,  # fully detached; survives the hook returning
         )
+        if reconnect:
+            from . import _telemetry
+            _telemetry.log("connect", "reconnect_offered", tool=tool)
     except Exception:
         try:
             lock.unlink()  # release so a later hook can retry, not wedged for the TTL

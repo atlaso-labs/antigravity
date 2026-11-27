@@ -182,6 +182,10 @@ _MIGRATIONS = (
     # after its own verdict said cloud-linked, may send the row. NULL = LEGACY (queued by an
     # older client, capturing tool unknown): never sent by anyone, kept locally (see TOOLLESS).
     "ALTER TABLE outbox ADD COLUMN tool TEXT",
+    # Identity provenance (held notes): a hash of the account this client was linked to when
+    # it queued the row (identity_acct), or NULL when that was not proven at capture time.
+    # Older clients never write it (NULL). Never a raw user id.
+    "ALTER TABLE outbox ADD COLUMN acct TEXT",
 )
 
 # `list_outbox(tool=...)` default: every row, whatever tool queued it (inspection, tests).
@@ -199,6 +203,100 @@ ANY_TOOL = object()
 # (CodeRedTeam 9ddd4105).
 TOOLLESS = ""
 _PROVENANCE_PREFIX = "outbox_tool:"
+
+# HELD NOTES. Every released client wrote the capturing tool as the FIRST TAG of what it queued
+# (capture: [source_tag or tool or "atlaso", "auto", ...] since 6c3750357f; the MCP remember:
+# [tool, "manual"] since 93bcddf76e), but cache.db records no ACCOUNT: a legacy row may have
+# been captured while this device was linked to another account. So a legacy row is adopted
+# ONLY through the user's explicit opt-in (atlaso_client.held, adopt_held_snapshot), which
+# stamps it with the confirmed account; there is no automatic adoption (review 27 Nov 2026).
+# Rows naming ANOTHER tool are never part of a tool's adoption. Progress
+# of an adoption is kept in cache_meta under _HELD_UPLOAD_PREFIX + tool (opaque client ids and
+# counts only); a finished upload leaves a one-time notice record under _HELD_NOTICE_PREFIX +
+# tool for that tool's session-start banner.
+_HELD_UPLOAD_PREFIX = "held_upload:"
+_HELD_NOTICE_PREFIX = "held_notice:"
+# The ids a Python connector syncs under (status: whose own sync will upload a held row).
+HELD_SYNC_TOOLS = ("claude-code", "codex", "antigravity", "grok-build")
+
+
+def _held_record(raw: str | None) -> dict:
+    """An adoption progress record {ids, added, first, last}; a malformed one reads empty."""
+    try:
+        obj = json.loads(raw) if raw else {}
+    except (ValueError, TypeError):
+        obj = {}
+    obj = obj if isinstance(obj, dict) else {}
+    ids = obj.get("ids")
+    added = obj.get("added")
+    return {"ids": [i for i in ids if isinstance(i, str)] if isinstance(ids, list) else [],
+            "added": added if isinstance(added, int) and added > 0 else 0,
+            "first": obj.get("first") if isinstance(obj.get("first"), str) else None,
+            "last": obj.get("last") if isinstance(obj.get("last"), str) else None}
+
+
+def _held_notice_record(raw: str | None) -> dict:
+    """A one-time upload notice record {n, first, last}; a malformed one reads as n=0."""
+    rec = _held_record(raw)
+    try:
+        obj = json.loads(raw) if raw else {}
+        n = obj.get("n") if isinstance(obj, dict) else 0
+    except (ValueError, TypeError):
+        n = 0
+    return {"n": n if isinstance(n, int) and n > 0 else 0,
+            "first": rec["first"], "last": rec["last"]}
+
+
+def ack_held_notice(path: str | Path, tool: str, raw: str) -> None:
+    """Consume a held-notes notice record on its own short-lived connection (a session-start
+    hook acknowledges after its client, and so its cache, is closed). Deletes only when the
+    record still holds `raw`. Never raises."""
+    try:
+        con = sqlite3.connect(str(path), timeout=1.0)
+        try:
+            with con:
+                con.execute("DELETE FROM cache_meta WHERE k = ? AND v = ?",
+                            (_HELD_NOTICE_PREFIX + tool, raw))
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass
+
+
+_LINKED_IDENTITY = "linked_identity"
+
+
+def uid_hash(user_id: str) -> str:
+    """One-way hash of an account id (the raw id is never stored in cache.db)."""
+    return hashlib.sha256(("atlaso-uid\n" + str(user_id)).encode("utf-8")).hexdigest()[:32]
+
+
+def identity_acct(server: Any, user_id: Any) -> str | None:
+    """The identity stamp for (server, account): a hash, never the raw id. None when either
+    is unknown."""
+    if not (isinstance(server, str) and server and isinstance(user_id, str) and user_id):
+        return None
+    return hashlib.sha256(
+        ("atlaso-acct\n" + server.rstrip("/") + "\n" + user_id).encode("utf-8")).hexdigest()[:32]
+
+
+_UNTAGGED_FIRST = (None, "atlaso", "manual")
+
+
+def held_class(first: str | None) -> str:
+    """'tool' (a Python connector id), 'untagged' (no first tag, "atlaso" or "manual"), or
+    'other' (names some other tool, e.g. cursor: listed by name, never called untagged)."""
+    if first in HELD_SYNC_TOOLS:
+        return "tool"
+    return "untagged" if first in _UNTAGGED_FIRST else "other"
+
+
+def held_first_tag(tags_json: Any) -> str | None:
+    """The first tag of a queued row (the capturing tool, for rows released clients wrote),
+    or None when the tags are malformed, empty or the first tag is not a non-empty string."""
+    tags = _row_tags(tags_json if isinstance(tags_json, str) else None)
+    first = tags[0] if tags else None
+    return first if isinstance(first, str) and first else None
 
 
 def _outbox_digest(text: Any, polarity: Any, evidence_grade: Any, scope_note: Any,
@@ -829,16 +927,19 @@ class Cache:
         tags: list[str] | None = None,
         created_at: str | None = None,
         tool: str | None = None,
+        acct: str | None = None,
     ) -> None:
         created_at = created_at or _now_iso()
         tags_json = json.dumps(tags or [])
         if self._outbox_has_tool():
+            acol, amark, aval = ((", acct", ",?", (acct,)) if self._outbox_has_acct()
+                                 else ("", "", ()))
             self._conn.execute(
                 "INSERT OR REPLACE INTO outbox"
-                "(client_id, text, polarity, evidence_grade, scope_note, tags_json, created_at, attempts, tool) "
-                "VALUES(?,?,?,?,?,?,?,0,?)",
+                "(client_id, text, polarity, evidence_grade, scope_note, tags_json, created_at, attempts, tool"
+                + acol + ") VALUES(?,?,?,?,?,?,?,0,?" + amark + ")",
                 (client_id, text, polarity, evidence_grade, scope_note, tags_json, created_at,
-                 tool or TOOLLESS),  # never NULL: NULL means legacy, which is never sent
+                 tool or TOOLLESS, *aval),  # tool never NULL: NULL means legacy
             )
         else:
             # The column could not be added (the file was locked at open and is still locked
@@ -887,6 +988,49 @@ class Cache:
         self._adopt_provenance()
         self._outbox_tool_ready = True
         return True
+
+    def _outbox_has_acct(self) -> bool:
+        """Does the outbox carry the identity-stamp column? Added when an open could not."""
+        if getattr(self, "_outbox_acct_ready", False):
+            return True
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(outbox)")}
+        if "acct" not in cols:
+            try:
+                self._conn.execute("ALTER TABLE outbox ADD COLUMN acct TEXT")
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                return False
+        self._outbox_acct_ready = True
+        return True
+
+    def record_identity(self, server: Any, user_id: Any) -> str | None:
+        """This client just verified a cloud link for (server, account): remember WHICH account,
+        as {server, uid_hash, acct, at} (hashes only). Returns the identity stamp."""
+        acct = identity_acct(server, user_id)
+        if not acct:
+            return None
+        try:
+            cur = self.get_meta(_LINKED_IDENTITY)
+            if cur and json.loads(cur).get("acct") == acct:
+                return acct  # unchanged: no write on the hot path
+        except (sqlite3.Error, ValueError, TypeError, AttributeError):
+            pass
+        try:
+            self.set_meta(_LINKED_IDENTITY, json.dumps({
+                "server": server.rstrip("/"), "uid_hash": uid_hash(user_id), "acct": acct,
+                "at": _now_iso()}))
+        except sqlite3.Error:
+            pass
+        return acct
+
+    def linked_acct(self) -> str | None:
+        """The identity stamp of the account this cache last verified a link to, or None."""
+        try:
+            raw = self.get_meta(_LINKED_IDENTITY)
+            v = json.loads(raw).get("acct") if raw else None
+        except (sqlite3.Error, ValueError, TypeError, AttributeError):
+            return None
+        return v if isinstance(v, str) and v else None
 
     _DIGEST_COLUMNS = ("text", "polarity", "evidence_grade", "scope_note", "tags_json",
                        "created_at")
@@ -942,16 +1086,275 @@ class Cache:
             except sqlite3.Error:
                 pass
 
-    def list_outbox(self, limit: int = 100, *, tool: Any = ANY_TOOL) -> list[dict]:
+    # ── held notes ─────────────────────────────────────────────────────────────────────────
+    # cache.db records no account for rows older clients queued (tool IS NULL, "legacy"), so a
+    # legacy row may have been captured while this device was linked to another account. They
+    # are uploaded only with the user's explicit OK (atlaso_client.held): a previewed snapshot,
+    # bound to the linked account, adopted exactly to one cloud-linked tool and stamped with
+    # that account. Rows this client stamped for ANOTHER account (acct set, not the one linked
+    # now) are held too: no push sends them (list_outbox account filter); they go up if that
+    # account is linked again.
+    _HELD_COLUMNS = ("client_id",) + _DIGEST_COLUMNS
+    _HELD_LIVE = ("AND NOT EXISTS (SELECT 1 FROM forgotten f WHERE f.id = o.client_id) "
+                  "AND EXISTS (SELECT 1 FROM cached_deposits d WHERE d.id = o.client_id "
+                  "            AND d.retracted = 0) ")
+
+    def _held_rows(self) -> list:
+        """Live legacy rows (NULL tool), oldest first: id not forgotten, and the optimistic local
+        row (written with the outbox row by every enqueue) still there and not retracted (a
+        missing one was pruned: retracted, or dropped by the legacy upgrade)."""
+        return self._conn.execute(
+            "SELECT " + ", ".join(f"o.{c}" for c in self._HELD_COLUMNS) + " FROM outbox o "
+            "WHERE o.tool IS NULL " + self._HELD_LIVE +
+            "ORDER BY o.created_at, o.client_id").fetchall()
+
+    @staticmethod
+    def _held_selects(first: str | None, tool: str, include_untagged: bool) -> bool:
+        """Does a legacy row with this first tag belong to an opt-in upload through `tool`? Its
+        own tag always; with include_untagged also UNTAGGED rows (held_class "untagged").
+        Never rows naming another tool, known (wait for that tool) or not (other_tags)."""
+        if first == tool:
+            return True
+        return include_untagged and held_class(first) == "untagged"
+
+    def held_snapshot(self, tool: str, *, include_untagged: bool = False) -> list[tuple]:
+        """Read only: the legacy rows an opt-in upload through `tool` would take, as
+        (client_id, *digest columns) tuples. The preview shows it; adopt_held_snapshot takes
+        exactly it."""
+        if not isinstance(tool, str) or not tool or not self._has_column("tool"):
+            return []
+        return [tuple(r) for r in self._held_rows()
+                if self._held_selects(held_first_tag(r["tags_json"]), tool, include_untagged)]
+
+    def held_breakdown(self) -> dict:
+        """Content-free view of everything held on this device. Read only.
+          count, first, last  all held rows and their capture-date range
+          by_tool {t: n}, by_tool_range {t: [first, last]}  legacy rows whose first tag is a
+                              Python connector's id (what `atlaso held` adds through it)
+          other_tags {name: n}  legacy rows naming any other tool (listed by name)
+          untagged            legacy rows with no first tag, "atlaso" or "manual"
+          other_account       rows this client stamped for an account other than the one
+                              linked now (saved while linked to a different Atlaso account)"""
+        out: dict[str, Any] = {"count": 0, "first": None, "last": None, "by_tool": {},
+                               "by_tool_range": {}, "other_tags": {}, "untagged": 0,
+                               "other_account": 0}
+
+        def seen(at: Any) -> None:
+            if isinstance(at, str) and at:
+                out["first"] = at if out["first"] is None else min(out["first"], at)
+                out["last"] = at if out["last"] is None else max(out["last"], at)
+
+        # the same live rows the opt-in selects from (_held_rows), so status, the reminder and
+        # `atlaso held` always show the same numbers
+        has_tool = self._has_column("tool")
+        rows = (self._held_rows() if has_tool else
+                self._conn.execute("SELECT tags_json, created_at FROM outbox").fetchall())
+        for r in rows:
+            out["count"] += 1
+            seen(r["created_at"])
+            first = held_first_tag(r["tags_json"])
+            kind = held_class(first)
+            if kind == "tool":
+                out["by_tool"][first] = out["by_tool"].get(first, 0) + 1
+                lo, hi = out["by_tool_range"].get(first, [None, None])
+                at = r["created_at"] if isinstance(r["created_at"], str) else None
+                if at:
+                    lo = at if lo is None else min(lo, at)
+                    hi = at if hi is None else max(hi, at)
+                out["by_tool_range"][first] = [lo, hi]
+            elif kind == "untagged":
+                out["untagged"] += 1
+            else:
+                name = str(first)[:40]
+                out["other_tags"][name] = out["other_tags"].get(name, 0) + 1
+        linked = self.linked_acct()
+        if has_tool and linked and self._has_column("acct"):
+            for r in self._conn.execute(
+                    "SELECT created_at FROM outbox WHERE tool IS NOT NULL AND acct IS NOT NULL "
+                    "AND acct != ?", (linked,)).fetchall():
+                out["count"] += 1
+                out["other_account"] += 1
+                seen(r["created_at"])
+        return out
+
+    def _tag_held(self, tool: str, rows: list[tuple], acct: str | None) -> tuple[list[str], int]:
+        """Inside the caller's write transaction: tag each (client_id, *bytes) row with `tool`
+        (and stamp it with `acct`, the account linked now) only if it is still NULL, still holds
+        exactly those bytes, is not forgotten and its local row is live. Records the adopted ids
+        for progress. Returns (adopted, changed)."""
+        same = " AND ".join(f"{c} IS ?" for c in self._DIGEST_COLUMNS)
+        stamp = self._has_column("acct")
+        adopted: list[str] = []
+        changed = 0
+        for row in rows:
+            cid, values = row[0], row[1:]
+            n = self._conn.execute(
+                "UPDATE outbox SET tool = ?" + (", acct = ?" if stamp else "") +
+                " WHERE client_id = ? AND tool IS NULL AND " + same +
+                " AND NOT EXISTS (SELECT 1 FROM forgotten f WHERE f.id = outbox.client_id)"
+                " AND EXISTS (SELECT 1 FROM cached_deposits d WHERE d.id = outbox.client_id"
+                "             AND d.retracted = 0)",
+                (tool, *((acct,) if stamp else ()), cid, *values)).rowcount
+            if n:
+                adopted.append(cid)
+            else:
+                changed += 1
+        if adopted:
+            key = _HELD_UPLOAD_PREFIX + tool
+            r = self._conn.execute("SELECT v FROM cache_meta WHERE k = ?", (key,)).fetchone()
+            rec = _held_record(r["v"] if r else None)
+            rec["ids"] = list(dict.fromkeys([*rec["ids"], *adopted]))
+            self._conn.execute(
+                "INSERT INTO cache_meta(k, v) VALUES(?, ?) "
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v", (key, json.dumps(rec)))
+        return adopted, changed
+
+    def adopt_held_snapshot(self, tool: str, snapshot: list[tuple], acct: str | None) -> dict:
+        """OPT-IN adoption (atlaso_client.held, after the user's explicit OK): tag exactly the
+        previewed rows (held_snapshot) with `tool` and stamp them with `acct` (the account they
+        were confirmed for), each only if it is still NULL and still holds the previewed bytes.
+        Same safety as _adopt_provenance: ONE write transaction (BEGIN IMMEDIATE), an
+        unchanged-bytes UPDATE, forgotten / retracted rows never. Rows outside the snapshot are
+        never touched. Returns {adopted, changed}; busy: nothing adopted."""
+        counts = {"adopted": 0, "changed": 0}
+        if not (isinstance(tool, str) and tool) or not self._has_column("tool") or not snapshot:
+            return counts
+        try:
+            self._write_txn()
+            adopted, changed = self._tag_held(tool, [tuple(r) for r in snapshot], acct)
+            self._conn.commit()
+            counts = {"adopted": len(adopted), "changed": changed}
+            _telemetry.log("cache", "held_adopted", tool=tool, **counts)
+        except sqlite3.OperationalError:
+            try:
+                self._conn.rollback()
+            except sqlite3.Error:
+                pass
+        return counts
+
+    def _has_column(self, col: str) -> bool:
+        """Outbox column present? Adds tool/acct when an earlier open could not (unless this is
+        a read-only handle: then just looks)."""
+        if getattr(self, "_readonly", False):
+            return col in {r[1] for r in self._conn.execute("PRAGMA table_info(outbox)")}
+        return self._outbox_has_tool() if col == "tool" else self._outbox_has_acct()
+
+    @classmethod
+    def open_readonly(cls, path: str | Path) -> "Cache":
+        """A handle that can never change the file: SQLite read-only mode, no schema, no
+        migration, no maintenance (the held-notes preview). A missing file reads as empty."""
+        self = cls.__new__(cls)
+        self.path = Path(path)
+        self._readonly = True
+        self._scope_key_ready = False
+        if self.path.exists():
+            self._conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=1.0)
+        else:
+            self._conn = sqlite3.connect(":memory:")
+            self._conn.executescript(_SCHEMA)
+            for mig in _MIGRATIONS:
+                try:
+                    self._conn.execute(mig)
+                except sqlite3.OperationalError:
+                    pass
+        self._conn.row_factory = sqlite3.Row
+        return self
+
+    def held_upload_progress(self, tool: str | None, added: dict[str, str]) -> dict | None:
+        """Settle an adoption's progress after a push. `added` maps client_id → created_at for
+        the items the server answered "added" in this push. Adopted ids that were added are
+        counted (with their capture dates); ids no longer queued for `tool` (a duplicate, a
+        refusal, a quarantine, a forget) leave the record uncounted. When none is left, the
+        progress record is replaced by a one-time notice record (only if anything was added)
+        and that notice record is returned. Never raises."""
+        if not tool:
+            return None
+        key = _HELD_UPLOAD_PREFIX + tool
+        try:
+            raw = self.get_meta(key)
+            if raw is None:
+                return None
+            rec = _held_record(raw)
+            for cid in rec["ids"]:
+                at = added.get(cid)
+                if cid in added:
+                    rec["added"] += 1
+                    if isinstance(at, str) and at:
+                        rec["first"] = at if not rec["first"] else min(rec["first"], at)
+                        rec["last"] = at if not rec["last"] else max(rec["last"], at)
+            pending = [cid for cid in rec["ids"] if cid not in added]
+            still: set[str] = set()
+            for k in range(0, len(pending), 500):
+                chunk = pending[k:k + 500]
+                still.update(r["client_id"] for r in self._conn.execute(
+                    "SELECT client_id FROM outbox WHERE tool = ? AND client_id IN ("
+                    + ",".join("?" * len(chunk)) + ")", (tool, *chunk)))
+            rec["ids"] = [cid for cid in pending if cid in still]
+            with self._conn:
+                if rec["ids"]:
+                    self._conn.execute("UPDATE cache_meta SET v = ? WHERE k = ?",
+                                       (json.dumps(rec), key))
+                    return None
+                self._conn.execute("DELETE FROM cache_meta WHERE k = ?", (key,))
+                if rec["added"] <= 0:
+                    return None
+                nkey = _HELD_NOTICE_PREFIX + tool
+                r = self._conn.execute("SELECT v FROM cache_meta WHERE k = ?", (nkey,)).fetchone()
+                note = _held_notice_record(r["v"] if r else None)
+                note["n"] += rec["added"]
+                for at in (rec["first"], rec["last"]):
+                    if at:
+                        note["first"] = at if not note["first"] else min(note["first"], at)
+                        note["last"] = at if not note["last"] else max(note["last"], at)
+                self._conn.execute(
+                    "INSERT INTO cache_meta(k, v) VALUES(?, ?) "
+                    "ON CONFLICT(k) DO UPDATE SET v = excluded.v", (nkey, json.dumps(note)))
+            _telemetry.log("cache", "held_uploaded", tool=tool, added=rec["added"])
+            return note
+        except (sqlite3.Error, ValueError, TypeError):
+            try:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+            except sqlite3.Error:
+                pass
+            return None
+
+    def held_notice(self, tool: str | None) -> tuple[dict, str] | None:
+        """The pending one-time "held notes were uploaded" record for `tool`, with its raw value
+        (the acknowledgement deletes exactly that value), or None."""
+        if not tool:
+            return None
+        try:
+            raw = self.get_meta(_HELD_NOTICE_PREFIX + tool)
+        except sqlite3.Error:
+            return None
+        if raw is None:
+            return None
+        note = _held_notice_record(raw)
+        return (note, raw) if note["n"] > 0 else None
+
+    def ack_held_notice(self, tool: str, raw: str) -> None:
+        """Consume the notice record, only if it still holds `raw` (a merge that landed after
+        the banner was built stays due)."""
+        ack_held_notice(self.path, tool, raw)
+
+    def list_outbox(self, limit: int = 100, *, tool: Any = ANY_TOOL,
+                    account: Any = ANY_TOOL) -> list[dict]:
         """Queued rows, oldest first. `tool` scopes what a SYNC may send: a tool name returns
         that tool's own rows only; None (a tool-less client) returns tool-less rows only. Legacy
         untagged rows (NULL) are returned to NO sync: their capturing tool is unknown, so no
-        verdict can release them (CodeRedTeam a5c54add). The filter runs before LIMIT."""
+        verdict can release them (CodeRedTeam a5c54add). `account` (with `tool`): only rows
+        stamped for that account or not stamped at all; None = unstamped rows only. The
+        filters run before LIMIT."""
         where, args = "", ()
         if tool is not ANY_TOOL and not self._outbox_has_tool():
             return []  # no column → every row is legacy/untagged → nothing is sendable
         elif tool is not ANY_TOOL:
             where, args = "WHERE tool = ? ", (tool or TOOLLESS,)
+            if account is not ANY_TOOL and self._outbox_has_acct():
+                # S1: a row stamped for ANOTHER account never goes to the one linked now
+                where += "AND (acct IS NULL OR acct IS ?) "
+                args = (*args, account)
         rows = self._conn.execute(
             "SELECT client_id, text, polarity, evidence_grade, scope_note, tags_json, "
             "attempts, edge_blocks, created_at "
@@ -1014,8 +1417,9 @@ class Cache:
         by the flush debounce to force a push when items are going stale."""
         if not self._outbox_has_tool():
             return None  # every row is legacy: nothing a sync could send
+        where, args = self._sendable_where()
         r = self._conn.execute(
-            "SELECT min(created_at) AS m FROM outbox WHERE tool IS NOT NULL").fetchone()
+            "SELECT min(created_at) AS m FROM outbox WHERE " + where, args).fetchone()
         return r["m"] if r and r["m"] else None
 
     def resolve_outbox(
@@ -1305,21 +1709,31 @@ class Cache:
         return {"cached": int(total), "pending": int(pending),
                 "quarantined": int(quarantined), "cursor": self.get_cursor()}
 
+    def _sendable_where(self) -> tuple[str, tuple]:
+        """Rows some sync may send: tagged, and not stamped for an account other than the one
+        this cache last verified a link to (S1)."""
+        linked = self.linked_acct()
+        if linked and self._outbox_has_acct():
+            return "tool IS NOT NULL AND (acct IS NULL OR acct = ?)", (linked,)
+        return "tool IS NOT NULL", ()
+
     def kept_local_count(self) -> int:
-        """Queued legacy rows (NULL tool) that stay on this device and are never uploaded.
-        Display only (Client.status): counts() keeps reporting them inside `pending`."""
+        """Queued rows held on this device: legacy rows (NULL tool) and rows stamped for another
+        account. Display only (Client.status): counts() keeps reporting them in `pending`."""
         if not self._outbox_has_tool():
             return int(self._conn.execute("SELECT count(*) AS n FROM outbox").fetchone()["n"])
+        where, args = self._sendable_where()
         return int(self._conn.execute(
-            "SELECT count(*) AS n FROM outbox WHERE tool IS NULL").fetchone()["n"])
+            "SELECT count(*) AS n FROM outbox WHERE NOT (" + where + ")", args).fetchone()["n"])
 
     def sendable_count(self) -> int:
-        """Queued rows SOME sync may send: every tagged row. Legacy untagged rows are kept on
-        the device and never uploaded, so they must not keep forcing flushes (_flush)."""
+        """Queued rows SOME sync may send (_sendable_where). Held rows never upload on their own,
+        so they must not keep forcing flushes (_flush)."""
         if not self._outbox_has_tool():
             return 0  # every row is legacy
+        where, args = self._sendable_where()
         return int(self._conn.execute(
-            "SELECT count(*) AS n FROM outbox WHERE tool IS NOT NULL").fetchone()["n"])
+            "SELECT count(*) AS n FROM outbox WHERE " + where, args).fetchone()["n"])
 
     # ── capture-quality telemetry (content-free daily counters) ───────────────
     def _apply_drop(self, day: str, reason: str, n: int) -> None:

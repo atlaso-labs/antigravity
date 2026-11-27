@@ -44,6 +44,14 @@ RECONNECT_REQUIRED = "reconnect_required"  # app says this device must reconnect
 NOT_ENTITLED = "not_entitled"              # tool isn't the active tool on a free plan
 NOT_CONNECTED = "not_connected"            # never linked (no token)
 
+# `cause` refines an auth verdict for the session-start notice and the expired-sign-in
+# reconnect (state files written by older clients have none). Old readers ignore it.
+CAUSE_INVALID_TOKEN = "invalid_token"            # server: token unknown or expired
+CAUSE_CREDENTIAL_REVOKED = "credential_revoked"  # server: the user removed this tool
+CAUSE_TOOL_REMOVED = "tool_removed"              # exchange refused: the user removed this tool
+# Causes that mean the user removed this tool from this device on purpose.
+USER_REMOVED_CAUSES = (CAUSE_CREDENTIAL_REVOKED, CAUSE_TOOL_REMOVED)
+
 # Reasons that stem from a verified credential rejection → the longer TTL.
 _AUTH_REASONS = (REVOKED, AUTH_REJECTED, RECONNECT_REQUIRED)
 
@@ -64,7 +72,8 @@ def default() -> dict:
     """An unverified (stale) LINKED verdict for no particular identity — the
     safe baseline that forces re-verification and shows no notice."""
     return {"mode": LINKED, "reason": None, "since": 0, "checked_at": 0,
-            "active_tool": None, "tool": None, "device_id": None, "grace": None}
+            "active_tool": None, "tool": None, "device_id": None, "grace": None,
+            "cause": None, "cred": None}
 
 
 def get() -> dict:
@@ -105,20 +114,27 @@ def _write(obj: dict) -> None:
 
 
 def set_local_only(reason: str, *, active_tool: Optional[str] = None,
-                   tool: Optional[str] = None, device_id: Optional[str] = None) -> None:
+                   tool: Optional[str] = None, device_id: Optional[str] = None,
+                   cause: Optional[str] = None, cred: Optional[str] = None) -> None:
     """Mark the device LOCAL-ONLY for the given (tool, device_id). Preserves `since`
     if we were ALREADY local-only for the SAME reason + identity, so a connector's
-    one-time notice isn't re-shown every turn."""
+    notice keeps the date sync stopped. `cause` (the server's error code, or
+    CAUSE_TOOL_REMOVED) and `cred` ("shared"/"own": which credential was rejected)
+    refine the notice; a later verdict for the same reason without them keeps the
+    known ones."""
     cur = get()
     now = int(time.time())
     same = (cur.get("mode") == LOCAL_ONLY and cur.get("reason") == reason
             and cur.get("tool") == tool and cur.get("device_id") == device_id)
     since = (cur.get("since") or now) if same else now
+    if same and cause is None:
+        cause, cred = cur.get("cause"), cur.get("cred")
     # A local-only verdict means we're past the grace window (or never in one) —
     # clear any stale grace banner.
     _write({"mode": LOCAL_ONLY, "reason": reason, "since": since,
             "checked_at": now, "active_tool": active_tool,
-            "tool": tool, "device_id": device_id, "grace": None})
+            "tool": tool, "device_id": device_id, "grace": None,
+            "cause": cause, "cred": cred})
 
 
 def set_linked(*, tool: Optional[str] = None, device_id: Optional[str] = None,

@@ -138,9 +138,11 @@ def classify_scope(user_text: str) -> str:
 # 6428f626), so a project key must not pass through here.
 _ASSIGN_NAME = (r"[A-Za-z0-9_]*(?:api[_-]?key|secret|token|password|passwd|pwd|"
                 r"access[_-]?key|client[_-]?secret|auth[_-]?token)[A-Za-z0-9_]*")
+# Linear on any input: the name is matched once (lookahead + backreference, as in the
+# server's assignment pattern) and the whitespace check looks no further than the value.
 _QUOTED_MULTIWORD_ASSIGNMENT = re.compile(
-    rf"(?i)\b({_ASSIGN_NAME})\s*[:=]\s*(?:\"(?=[^\"\n]*\s)[^\"\n]{{2,256}}\"|'(?=[^'\n]*\s)[^'\n]{{2,256}}')")
-_QUOTED_TAIL = re.compile(rf"(?i)\b({_ASSIGN_NAME})=\[REDACTED\](?=[^\"'\n]*\s)[^\"'\n]{{1,256}}[\"']")
+    rf"(?i)\b(?=({_ASSIGN_NAME}))\1\s*[:=]\s*(?:\"(?=[^\"\n]{{0,256}}\s)[^\"\n]{{2,256}}\"|'(?=[^'\n]{{0,256}}\s)[^'\n]{{2,256}}')")
+_QUOTED_TAIL = re.compile(rf"(?i)\b(?=({_ASSIGN_NAME}))\1=\[REDACTED\](?=[^\"'\n]{{0,256}}\s)[^\"'\n]{{1,256}}[\"']")
 _ENTROPY_THRESHOLD = _server_scrub._ENTROPY_THRESHOLD
 _entropy = _server_scrub._entropy
 

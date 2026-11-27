@@ -32,10 +32,13 @@ AND whose entropy is below 4.0 (measured ~1 in 3000 random 24-char keys);
 an unquoted assignment passphrase ends at the first function word (`password:
 purple and gold` keeps "and gold") or after 25 words, and its plain dictionary
 words are not swept where they appear alone elsewhere; a prose-label value that
-opens with a quote never closed on its line (`password is "<key>` clipped).
+opens with a quote never closed on its line (`password is "<key>` clipped); a value
+written as a placeholder (REDACTED, ***, xxxx, <redacted>; `_is_placeholder`) is taken
+as already blanked and left as written, so a real secret spelled exactly that way stays.
 """
 from __future__ import annotations
 
+import bisect
 import math
 import re
 import unicodedata
@@ -47,15 +50,23 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
         re.DOTALL)),
     ("openai_anthropic_key", re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b")),
+    ("openai_anthropic_key", re.compile(r"\batbt_[A-Za-z0-9_-]{16,}\b")),
     ("github_token", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}\b")),
     ("gitlab_token", re.compile(r"\bglpat-[A-Za-z0-9_-]{16,}\b")),
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
-    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    # A Google key may end in "-": no word boundary follows it there, so the shape also ends
+    # right after a trailing "-" (every earlier match still matches).
+    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}(?:\b|(?<=-))")),
+    # Google's newer "AQ." authorization key (format undocumented; public reports show "AQ.Ab"):
+    # 40+ key characters after AQ.Ab with at least one digit, so AQ.getAirQualityForRegion and
+    # long identifiers with no digit are left alone (r33 item 5).
+    ("google_aq_key", re.compile(r"\bAQ\.Ab(?=[A-Za-z_-]*[0-9])[A-Za-z0-9_-]{40,}")),
     ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
     # Stripe secret / restricted / webhook-signing keys (publishable pk_ keys are
     # client-side by design and stay — see _PUBLISHABLE).
     ("stripe_secret_key", re.compile(r"\b(?:[sr]k_(?:live|test)|whsec)_[A-Za-z0-9]{16,}\b")),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")),
+    ("jwt", re.compile(r"(?<![A-Za-z0-9_-])(?P<pre>(?:(?!\beyJ)[A-Za-z0-9_-])*)"
+                       r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")),
     ("bearer", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{16,}")),
     # scheme://user:password@host — the most common credential shape in a
     # developer session. The password may itself contain '@' (greedy, backtracks
@@ -67,10 +78,42 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # port followed by a query string, not a credential.
     ("uri_credential", re.compile(
         r"(?i)\b([a-z][a-z0-9+.\-]{1,30}://[^:/@\s\"'`]{0,64}:)(?!\d{1,5}[?#])([^\s\"'`/]{1,128})@(?=[A-Za-z0-9\[])")),
+    # The same user:password@host with NO scheme (SecurityEngineer fff4b962 N1), e.g. a
+    # remote pasted as `alice:<pw>@github.com/acme/repo`. Same groups and the same
+    # replacement as above. The user starts a token: not after a word character, '.', '/',
+    # a backslash, '@' or a bracket, so never inside scheme://user:pw@ (the rule above
+    # already masked it) nor inside a [REDACTED:kind] marker. The user is never a no-slash
+    # URI scheme or mail header (mailto:a@b, sip:, To:/Cc:/From:), a package alias
+    # (npm:pkg@1.0), the `project:` tag prefix (`project:team:alice@acme.dev` is a project
+    # key, while `project:alice:<pw>@host` still matches from `alice`), all digits
+    # (10:30@cafe) or a credential name (the assignment pass masks those whole). The
+    # password holds no bracket (it never spans a marker) and no backslash (a Windows path
+    # such as C:<backslash>Users<backslash>me@corp). The host is a network host: an IP
+    # literal `[`, or a name that has a dot or a port (`ref:main@origin`, `TODO:fix@later`
+    # and Gradle's `group:name:1.0@jar` have neither), and never an image digest
+    # (nginx:1.25@sha256:...). Group 3 is non-empty when a port or a path follows the host
+    # (URL context); without it the password must also look like a secret
+    # (`_N1_PLAIN_PASSWORD`), so `author:alice@example.com` is an address, not a credential.
+    ("uri_credential", re.compile(
+        r"(?i)(?<![A-Za-z0-9_.%+~\\/@\[\]-])"
+        r"(?!(?:mailto|sips?|xmpp|tel|im|pres|news|urn|acct|geo|data|npm|jsr|"
+        r"to|cc|bcc|from|re|fwd?|reply-to|sender|e-?mail|mail|contact|project):)"
+        # Lookaheads stay within the 64-character user: an unbounded run here rescanned a
+        # long word once per keyword in it (quadratic: 632 s on "token" x 104858).
+        r"(?![0-9]{1,64}:)"
+        r"(?![A-Za-z0-9_.%+~-]{0,63}?(?:api[_-]?key|secret|token|password|passwd|pwd|"
+        r"access[_-]?key|auth[_-]?token)[A-Za-z0-9_.%+~-]{0,63}:)"
+        r"([A-Za-z0-9_.%+~-]{1,64}:)(?!\d{1,5}[?#])([^\s\"'`/\\\[\]]{1,128})"
+        r"@(?!sha(?:1|224|256|384|512):)"
+        r"(?=\[|[A-Za-z0-9][A-Za-z0-9-]{0,62}(?:\.[A-Za-z0-9]|:[0-9]))"
+        r"(?=(\[|(?:[A-Za-z0-9-]{1,63}\.){0,8}[A-Za-z0-9-]{1,63}(?::[0-9]|/))?)")),
     # key-ish name = value  → keep the name, mask the value.
     ("assignment", re.compile(
-        r"(?i)\b([A-Za-z0-9_]*(?:api[_-]?key|secret|token|password|passwd|pwd|"
-        r"access[_-]?key|client[_-]?secret|auth[_-]?token)[A-Za-z0-9_]*)"
+        # The name is matched once, atomically (lookahead + backreference): every way to
+        # split it around a keyword ends at the same place, so retrying the splits when the
+        # value fails can only fail again, and on a long word of keywords it was quadratic.
+        r"(?i)\b(?=([A-Za-z0-9_]*(?:api[_-]?key|secret|token|password|passwd|pwd|"
+        r"access[_-]?key|client[_-]?secret|auth[_-]?token)[A-Za-z0-9_]*))\1"
         r"\s*[:=]\s*"
         # The value is masked WHOLE (BackendEngineer bb9ce163; field 8b51bc3a): taking only
         # the first word of `password = "purple strawberry mountain"` sent the rest to the
@@ -92,18 +135,32 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         #     Short values are vetted against the stopword list in the replacer so
         #     `PASSWORD=none` stays prose.
         r"|([\"']?)([^\s\"']{3,})"
-        r"((?:[ \t]+(?![A-Za-z0-9_.-]*[ \t]*[:=])(?!#|//)"
+        # (?=\S): a word starts only at a non-space, so a run of spaces before a line end
+        # is given back in one step (the lookahead below rescanned it on every step).
+        r"((?:[ \t]+(?=\S)(?![A-Za-z0-9_.-]*[ \t]*[:=])(?!#|//)"
         r"(?!\S*(?:api[_-]?key|secret|token|password|passwd|pwd|access[_-]?key|auth[_-]?token))"
         r"(?!(?:pass(?:phrase|code|word)?|pin|otp|key|creds?|credentials?|login|cvv2?|cvc|code)(?!\w))"
         r"(?:[^\s.;!?,()\"'`]|[.;!?,](?=\S))+){0,24})"
         r"([\"']?))")),
 ]
 
+# The scheme-less user:password@host rule (N1) is tried at every position, so text with no
+# '@' or no ':' (which it cannot match) skips it: the same result, without that scan.
+_URI_NO_SCHEME = next(p for k, p in _PATTERNS if k == "uri_credential" and "://" not in p.pattern)
+# A password N1 leaves alone when no port or path follows the host: lowercase letters and
+# `._+-`, with at most a capital first letter (`alice`, `bob`, `alice.smith`, `Alice`): the
+# local part of an address after a label (`author:alice@example.com`). A digit, any other
+# capital or any other character (`!`, `@`, `%`, `:`) reads as a secret. Every suffix of
+# such a password is one too, so a match skipped for it can hide no credential inside it.
+# Case-sensitive on purpose (the N1 rule itself is not).
+_N1_PLAIN_PASSWORD = re.compile(r"[A-Za-z]?[a-z._+-]*")
+
 # Pure hex caps Shannon entropy at log2(16) = 4.0, below the blob threshold, so
 # hex secrets need their own pass. Unlabeled hex is only taken at >=48 chars:
 # 32-hex (fixture ids, hyphenless UUIDs, md5) and 40-hex (git SHAs) are the
 # common non-secrets of developer text. Shorter hex is caught only when a
 # credential label sits next to it (label-adjacent pass). Digest prefixes exempt.
+_PEM_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
 _HEX = re.compile(r"(?<![A-Za-z0-9])(?:0x)?([0-9a-fA-F]{48,})(?![A-Za-z0-9])")
 _DIGEST_PREFIX = re.compile(r"(?i)(?:sha(?:1|256|512)|md5|digest|blake2b?)\s*[:=]?\s*$")
 
@@ -131,7 +188,7 @@ _TARGET = r"(?: (?:for|to|on|of) (?:my |the |our |his |her |their |your )?[\w.@/
 # must come first, or the bare-punctuation branch wins, leaves "it's X" as the
 # candidate, and the value escapes.
 _LINK = (
-    r"(?:\s*[,(?—:=\-]*\s*(?:it'?s|it is|that'?s|that is|which is|would be|should be)\s+"
+    r"(?:\s*(?:[,(?—:=\-]+\s*)?(?:it'?s|it is|that'?s|that is|which is|would be|should be)\s+"
     r"|\s+(?:is|was|are|were|reads|equals|remains|stays|becomes)(?:\s+(?:set\s+to|still|now|currently|just))?\s*[:=]?\s*"
     r"|\s+(?:will|would|should|must|has to|needs to)\s+be\s*"
     r"|\s*[:=—→]\s*|\s*-+>\s*"
@@ -196,6 +253,31 @@ _LEADING_DETERMINER = re.compile(r"(?i)^(?:the|a|an|my|your|our)\s+")
 # characters inside it are part of the value.
 _QUOTED = re.compile(r"([\"'`])(?P<v>(?:(?!\1)[^\n]){4,64})\1")
 _ASSIGN_MARKER = re.compile(r"\[REDACTED(?::[a-z_]+)?\]")
+
+# A value someone already blanked is a placeholder, not a secret (NM-N15 fix round, CodeRedTeam
+# a2d8682b): `aws_secret_access_key = REDACTED`, `password: ***`, `token=<redacted>`. It is left as
+# written: never masked, never vetted as a prose credential and never swept as residue. "REDACTED"
+# sits inside every marker this module writes, so sweeping it lengthened every marker once per copy
+# and a 4-line credentials template grew past twice its size. Only these shapes, in any case: the
+# word REDACTED, bare or bracketed ([REDACTED], [REDACTED:kind], <redacted>, (redacted)), and runs of
+# 3 or more '*', 'x' or U+2022. A value of several words is one only when every word is one.
+# Typed markers accept only the kinds actually emitted by this engine. Header words
+# fold ASCII case; kind names stay exactly lowercase, as emitted. No Unicode case folds.
+_MARKER_KINDS = frozenset(k for k, _ in _PATTERNS if k not in {"uri_credential", "assignment"}) | {
+    "hex_secret", "high_entropy", "residue",
+}
+_PLACEHOLDER = re.compile(
+    r"(?ai:redacted|\[redacted\]|<redacted>|\(redacted\)|x{3,})|\*{3,}|\u2022{3,}|"
+    r"(?ai:\[redacted:)(?:" + "|".join(sorted(_MARKER_KINDS)) + r")\]"
+)
+
+
+def _is_placeholder(value: str) -> bool:
+    if value != value.strip():
+        return False
+    words = value.split()
+    # The parser has already isolated each value: punctuation belongs to the password.
+    return bool(words) and all(_PLACEHOLDER.fullmatch(w) for w in words)
 
 # Words that legitimately follow "password is …" etc. without being the secret.
 _STOPWORDS = frozenset({
@@ -263,7 +345,7 @@ def _looks_credential_shaped(value: str) -> bool:
 def _vet_value(value: str, strong: bool) -> bool:
     """Decide whether a prose-position value is a secret worth redacting."""
     v = value.strip().rstrip(".!?,;:")
-    if len(v) < 4 or "REDACTED" in v:
+    if len(v) < 4 or "REDACTED" in v or _is_placeholder(value):
         return False
     if v.lower() in _STOPWORDS or _SPEC_VALUE.match(v) or _PUBLISHABLE.match(v):
         return False
@@ -332,12 +414,27 @@ def _apply_prose(pattern: re.Pattern[str], out: str, found: list[str],
     resumes right after each redaction (or after the link when no value was
     taken), so every credential on a line is visited. Each value taken is a
     confirmed credential: it feeds the residue sweep for EXACT duplicates
-    (fragments only if key-like)."""
+    (fragments only if key-like).
+
+    Linear in the number of redactions: the text is searched left to right and
+    joined once (rebuilding the whole text after every redaction was quadratic).
+    A redaction changes only one thing the next search can see: the character
+    before the resume point is "]" instead of the value's last character. That
+    flips a word boundary only when both characters around the resume point are
+    word characters (a value clipped mid-token); then the text is rebuilt first,
+    exactly as before."""
+    parts: list[str] = []
+    last = 0
     pos = 0
     while True:
+        if parts and pos == last < len(out) and _is_word(out[pos - 1]) and _is_word(out[pos]):
+            head = "".join(parts)
+            out = head + out[last:]
+            parts, last, pos = [head], len(head), len(head)
         m = pattern.search(out, pos)
         if not m:
-            return out
+            parts.append(out[last:])
+            return "".join(parts)
         label = m.group(1)
         strong = bool(_STRONG_RE.match(label))
         rest = m.group("rest")
@@ -348,12 +445,58 @@ def _apply_prose(pattern: re.Pattern[str], out: str, found: list[str],
         s, e = span
         found.append("prose_credential")
         residue.append((rest[s:e], _entropy(rest[s:e]) >= _KEYLIKE_ENTROPY))
-        prefix = out[: m.end()] + rest[:s] + "[REDACTED]"
-        out = prefix + out[m.end() + e:]
-        pos = len(prefix)
+        parts.append(out[last:m.end()] + rest[:s] + "[REDACTED]")
+        last = pos = m.end() + e
 
 
-def _residue_sweep(out: str, values: list[str]) -> tuple[str, bool]:
+def _is_word(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def _prose_value_index(text: str) -> tuple[list[int], list[int]]:
+    """Where the prose passes would take a value in `text`: (starts, ends) sorted by start,
+    with ends[i] the largest end among the first i+1 spans. Used by N1 to leave a
+    user:pw@host that is glued inside a labelled value (`pin=1234,bob:<pw>@db.host:5432`)
+    for the prose pass, which masks the whole value as it did before N1 (CodeRedTeam
+    98b13c3a B1). Every match is scanned (no resume after a value), so this can name a
+    span the prose pass later skips; the N1 re-run after the prose pass covers that."""
+    spans: list[tuple[int, int]] = []
+    for pattern in (_PROSE, _IMPERATIVE):
+        for m in pattern.finditer(text):
+            label = m.group(1)
+            span = _pick_value(m.group("rest"), bool(_STRONG_RE.match(label)),
+                               multiword=bool(_MULTIWORD_RE.match(label)))
+            if span is not None:
+                spans.append((m.end() + span[0], m.end() + span[1]))
+    spans.sort()
+    starts: list[int] = []
+    ends: list[int] = []
+    for s, e in spans:
+        starts.append(s)
+        ends.append(max(e, ends[-1]) if ends else e)
+    return starts, ends
+
+
+def _inside_prose_value(index: tuple[list[int], list[int]], pos: int, end: int | None = None) -> bool:
+    """True when a prose span starts before `pos` and covers the entire [pos, end) match."""
+    starts, ends = index
+    i = bisect.bisect_left(starts, pos) - 1
+    return i >= 0 and ends[i] >= (pos + 1 if end is None else end)
+
+
+class ScrubBudgetExceeded(Exception):
+    """The residue sweep would pass the caller's cap (``scrub(max_values=, max_passes=)``).
+    Raised before any partial result exists: the caller must not use the text at all."""
+
+
+# A maximal run of ASCII digits: the only thing a short ASCII pure-digit value can match
+# (_sweep_exact matches such a value only between non-[0-9] characters).
+_DIGIT_RUN = re.compile(r"[0-9]+")
+_RESIDUE_MARK = "[REDACTED:residue]"
+
+
+def _residue_sweep(out: str, values: list[tuple[str, bool]], *, max_values: int | None = None,
+                   max_passes: int | None = None, growth_floor: int | None = None) -> tuple[str, bool]:
     """Redact any >=12-char fragment of an already-redacted key-like value that
     still appears elsewhere in the text (split keys, partial echoes, backup
     copies). Anchored: one substring probe per 12-char window, extended
@@ -365,14 +508,117 @@ def _residue_sweep(out: str, values: list[str]) -> tuple[str, bool]:
     direction of false positives (windows that no longer exist), and each such
     entry is verified once against the live text and then dropped. Rebuilding
     the index after every hit (v5) made the sweep superlinear in the number of
-    hits — 800 duplicated keys cost ~2s; now ~50ms."""
+    hits — 800 duplicated keys cost ~2s; now ~50ms.
+
+    Repeated values (CodeRedTeam 681ff3e3, F1): the output is exactly the output of
+    sweeping every value in list order, but (a) short ASCII pure-digit values are swept
+    together in ONE pass over the text's digit runs, run just before the next sweep of
+    any other kind (and at the end), and (b) a value whose sweep found nothing is not
+    swept again until the text has changed. Both are exact: a short ASCII pure-digit
+    value matches only a whole run of ASCII digits, and its marker holds no ASCII digit,
+    so these sweeps never change what another of them matches; and a sweep is a function
+    of the text and the value alone (the window index only shrinks, which can only turn a
+    find into a miss). So 455 copies of "pin=1234" cost one pass, not 455.
+
+    ``max_values`` / ``max_passes`` (None = no cap; ingest passes none): more distinct
+    values than ``max_values``, or more passes over the text than ``max_passes``, raises
+    ScrubBudgetExceeded (the Gateway leaves that memory out). A pass is a digit regex sweep
+    (hit or miss) or any other sweep that changes the text (an exact substring sweep, a
+    fragment replacement). With ``max_passes`` set the output may also not grow past twice
+    the sweep's input: a value inside the marker ("RED", "ACTED"; CodeRedTeam 832924b6,
+    SecurityEngineer d05c720a) is found again in every marker written for it, so each of its
+    sweeps hits and lengthens every marker. Counting hits bounds the number of such sweeps
+    and the growth bound bounds their size. ``growth_floor`` (code points) lifts that bound to
+    at least this size, so a short text whose few markers grow is not refused for growth that
+    costs nothing (the brain's stored-text caps); None keeps twice the input. A text that
+    raises none of these gets the same output as with no cap. A placeholder value
+    (``_is_placeholder``) is never swept and never counted."""
+    if max_values is not None:
+        distinct = {v.strip() for v, _ in values if not _is_placeholder(v)}
+        distinct.discard("")
+        if len(distinct) > max_values:
+            raise ScrubBudgetExceeded("values")
     hit = False
     win = 12
     windows: set[str] | None = None
+    done: set[str] = set()
+    epoch = 0                          # bumped whenever `out` changes
+    clean: dict[str, int] = {}         # exact-swept value -> epoch at which its sweep found nothing
+    walked: dict[str, int] = {}        # fragment-walked value -> epoch at which its walk found nothing
+    pending: set[str] = set()          # short ASCII pure-digit values not yet swept
+    passes = 0
+    grow_cap = max(2 * len(out), growth_floor or 0)   # with max_passes: the output may not grow past this
+
+    def _pass() -> None:
+        nonlocal passes
+        passes += 1
+        if max_passes is not None and passes > max_passes:
+            raise ScrubBudgetExceeded("passes")
+
+    def _changed(counted: bool) -> None:
+        # a sweep just changed `out`: count it unless it was counted already, and stop a text
+        # that grows on its own markers (only when capped: ingest output is never cut short)
+        if max_passes is None:
+            return
+        if not counted:
+            _pass()
+        if len(out) > grow_cap:
+            raise ScrubBudgetExceeded("growth")
+
+    def _flush() -> None:
+        # every pending short ASCII pure-digit value, swept at once: a digit run equal to one
+        # of them is replaced, as the per-value sweeps in list order would replace it
+        nonlocal out, hit, epoch
+        if not pending:
+            return
+        _pass()
+        n = 0
+
+        def repl(m: re.Match[str]) -> str:
+            nonlocal n
+            if m.group(0) in pending:
+                n += 1
+                return _RESIDUE_MARK
+            return m.group(0)
+        new = _DIGIT_RUN.sub(repl, out)
+        if n:
+            out, hit, epoch = new, True, epoch + 1
+            _changed(counted=True)
+        for d in pending:
+            clean[d] = epoch           # no run equals it any more
+        pending.clear()
+
+    def _exact(v: str) -> None:
+        nonlocal out, hit, epoch
+        _flush()
+        if clean.get(v) == epoch:
+            return                     # found nothing in this very text before
+        regex = v.isdigit() and len(v) < win
+        if regex:
+            _pass()                    # a regex pass, hit or miss
+        new, h = _sweep_exact(out, v, windows)
+        if h:
+            out, hit, epoch = new, True, epoch + 1
+            _changed(counted=regex)    # a substring sweep counts only when it changes the text
+        else:
+            clean[v] = epoch
+
     for v, fragments_ok in values:
         v = v.strip()
-        if not v or len(v) > 256:
+        if not v or len(v) > 256 or _is_placeholder(v):
             continue
+        # An exact-only value already swept as a SUBSTRING left no copy behind, and a later
+        # marker can rebuild one only if v holds a bracket or sits inside the marker, so
+        # sweeping it again is a no-op. Pure-digit values never enter `done` (R125/R126,
+        # b76n): they are matched only between non-digits, so another value's sweep can turn
+        # the digit beside a copy into a marker and free that copy. Fragment-walked values
+        # are re-walked as before.
+        exact_only = not (fragments_ok and len(v) >= win and _entropy(v) >= _KEYLIKE_ENTROPY)
+        if exact_only and v in done:
+            continue
+        if (exact_only and not v.isdigit() and "[" not in v and "]" not in v
+                and v not in _RESIDUE_MARK):
+            done.add(v)
         ent = _entropy(v)
         # DOCTRINE (lab rounds 6+7): nothing may exempt a value once any rule has
         # confirmed it is a credential. Every value here was confirmed by an earlier
@@ -389,9 +635,16 @@ def _residue_sweep(out: str, values: list[str]) -> tuple[str, bool]:
         # check first left 13 stale windows per value for the walk to re-verify
         # (800 keys 2.0s, 3000 keys 30s).
         if not (fragments_ok and len(v) >= win and ent >= _KEYLIKE_ENTROPY):
-            out, h = _sweep_exact(out, v, windows)
-            hit = hit or h
+            if v.isascii() and v.isdigit() and len(v) < win:
+                if clean.get(v) != epoch:
+                    pending.add(v)     # swept with the others in one pass (_flush)
+                continue
+            _exact(v)
             continue
+        _flush()
+        if walked.get(v) == epoch:
+            continue                   # walk and safety net found nothing in this very text
+        before = epoch
         i = 0
         while i + win <= len(v):
             frag = v[i:i + win]
@@ -401,8 +654,6 @@ def _residue_sweep(out: str, values: list[str]) -> tuple[str, bool]:
             if "REDACTED" in frag or _PLAIN_WORDS.fullmatch(frag):
                 i += 1
                 continue
-            if windows is None:
-                windows = {out[k:k + win] for k in range(len(out) - win + 1)}
             if frag not in windows:
                 i += 1
                 continue
@@ -417,13 +668,16 @@ def _residue_sweep(out: str, values: list[str]) -> tuple[str, bool]:
                 j += 1
             frag = v[i:j]
             # no identifier exemption here: the fragment is a slice of a confirmed credential
-            out = out.replace(frag, "[REDACTED:residue]")
-            hit = True
+            out = out.replace(frag, _RESIDUE_MARK)
+            hit, epoch = True, epoch + 1
+            _changed(counted=False)
             i = j
         # safety net: an exact duplicate the walk could not see (every window of it
         # plain lowercase words, e.g. a diceware key with digits only at the end)
-        out, h = _sweep_exact(out, v, windows)
-        hit = hit or h
+        _exact(v)
+        if epoch == before:
+            walked[v] = epoch
+    _flush()
     return out, hit
 
 
@@ -457,7 +711,8 @@ def _sweep_exact(out: str, v: str, windows: set[str]) -> tuple[str, bool]:
     return out.replace(v, "[REDACTED:residue]"), True
 
 
-def scrub(text: str) -> tuple[str, list[str]]:
+def scrub(text: str, *, max_values: int | None = None, max_passes: int | None = None,
+          growth_floor: int | None = None) -> tuple[str, list[str]]:
     """Return (scrubbed_text, kinds_redacted).
 
     The text is NFC-normalized first (lab round 9): a credential stated in one
@@ -503,7 +758,7 @@ def scrub(text: str) -> tuple[str, list[str]]:
                 value, rest = value + tail[:end], (tail[end:] + m.group(7) if tail[end:] else "")
         # Recalled content can pass through the ingress scrubber again.
         # Keep only our complete redaction markers stable on that pass.
-        if _ASSIGN_MARKER.fullmatch(value):
+        if _ASSIGN_MARKER.fullmatch(value) or _is_placeholder(value):
             return m.group(0)
         # schema/type/scheme descriptors and publishable keys are not secrets;
         # a short value that is a plain stop/common word is prose, not a credential
@@ -534,18 +789,58 @@ def scrub(text: str) -> tuple[str, list[str]]:
                                        and not _FILENAME_LIKE.search(tok.rstrip("!?.,;:"))))
         return f"{m.group(1)}=[REDACTED]{rest}"
 
+    # N1 matches left for the prose pass (glued inside a labelled value): their passwords.
+    # A text with none takes exactly the path it took before this rule existed.
+    n1_deferred: set[str] = set()
     for kind, pat in _PATTERNS:
-        def _repl(m: re.Match[str], _kind: str = kind) -> str:
+        if pat is _URI_NO_SCHEME and ("@" not in out or ":" not in out):
+            continue
+        prose_index: list[tuple[list[int], list[int]]] = []  # built on N1's first glued match
+        if kind == "private_key":
+            # Every match ends at an END line, so nothing after the last one can match; a
+            # BEGIN with no END after it would otherwise rescan to the end of the text
+            # (quadratic on many BEGIN lines). Exact: the same matches, found in linear time.
+            last = None
+            for last in _PEM_END.finditer(out):
+                pass
+            if last is None:
+                continue
+            head, tail_text = out[: last.end()], out[last.end():]
+        else:
+            head, tail_text = out, ""
+        def _repl(m: re.Match[str], _kind: str = kind, _n1: bool = pat is _URI_NO_SCHEME) -> str:
             if _kind == "uri_credential":
+                if (_n1 and not m.group(3)
+                        and _N1_PLAIN_PASSWORD.fullmatch(m.group(2))):
+                    return m.group(0)
+                if _is_placeholder(m.group(2)):
+                    return m.group(0)          # `user:***@host`: already blanked
                 found.append(_kind)
                 residue_values.append((m.group(2), True))
+                # Glued to text before it (no space) inside the value a prose label takes
+                # (`pin=1234,bob:<pw>@db.host:5432`): masking only the password here made the
+                # prose pass skip the value (it holds a marker) and the PIN stayed visible.
+                # Left whole, the prose pass masks the value; the N1 re-run after it masks
+                # whatever the prose pass did not take. The password still feeds the sweep.
+                s = m.start()
+                if _n1 and s and not m.string[s - 1].isspace():
+                    if not prose_index:
+                        prose_index.append(_prose_value_index(m.string))
+                    if _inside_prose_value(prose_index[0], s, m.end()):
+                        n1_deferred.add(m.group(2))
+                        return m.group(0)
                 return f"{m.group(1)}[REDACTED]@"
             if _kind == "assignment":
                 return _assignment_repl(m)
+            if _kind == "jwt":
+                pre = m.group("pre")
+                found.append(_kind)
+                residue_values.append((m.group(0)[len(pre):], True))
+                return f"{pre}[REDACTED:jwt]"
             found.append(_kind)
             residue_values.append((m.group(0), True))
             return f"[REDACTED:{_kind}]"
-        out = pat.sub(_repl, out)
+        out = pat.sub(_repl, head) + tail_text
 
     def _hex_repl(m: re.Match[str]) -> str:
         tok = m.group(1)
@@ -558,6 +853,20 @@ def scrub(text: str) -> tuple[str, list[str]]:
 
     out = _apply_prose(_PROSE, out, found, residue_values)
     out = _apply_prose(_IMPERATIVE, out, found, residue_values)
+
+    if n1_deferred:
+        # Re-run N1 so a deferred user:pw@host the prose pass did not take is still masked.
+        # Its password was already counted and fed to the sweep when it was deferred.
+        def _n1_late_repl(m: re.Match[str]) -> str:
+            if _is_placeholder(m.group(2)):
+                return m.group(0)
+            if not m.group(3) and _N1_PLAIN_PASSWORD.fullmatch(m.group(2)):
+                return m.group(0)
+            if m.group(2) not in n1_deferred:
+                found.append("uri_credential")
+                residue_values.append((m.group(2), True))
+            return f"{m.group(1)}[REDACTED]@"
+        out = _URI_NO_SCHEME.sub(_n1_late_repl, out)
 
     def _value_first_repl(m: re.Match[str]) -> str:
         value = m.group("q") or m.group("u")
@@ -595,7 +904,8 @@ def scrub(text: str) -> tuple[str, list[str]]:
         return tok
     out = _BLOB.sub(_blob_repl, out)
 
-    out, residue = _residue_sweep(out, residue_values)
+    out, residue = _residue_sweep(out, residue_values, max_values=max_values,
+                                  max_passes=max_passes, growth_floor=growth_floor)
     if residue:
         found.append("residue")
 

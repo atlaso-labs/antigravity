@@ -178,6 +178,11 @@ def _exchange(server: str, token: str, tool: str, *, timeout: float = 8.0) -> Op
 
     if r.status_code == 200:
         try:
+            from . import api as _api
+            _api._note_accepted(r)  # the shared bearer was accepted (expired sign-in rule)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             body = r.json()
         except ValueError:
             return None

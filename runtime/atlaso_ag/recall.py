@@ -93,6 +93,8 @@ def run(payload: dict, client) -> dict | None:
     steps = []
     if notice:
         steps.append({"ephemeralMessage": notice})
+    for line in _session_notices(client):
+        steps.append({"ephemeralMessage": line})
     if block:
         steps.append({"ephemeralMessage": block})
     if not steps:
@@ -146,6 +148,27 @@ def _degraded_notice(res: dict, client) -> str | None:
         return _DEGRADED_TEXT
     except Exception:
         return None
+
+
+def _session_notices(client) -> list[str]:
+    """Antigravity has no session-start banner, so the shared notices (local-only reason and
+    fix, held-notes lines; atlaso_client.notice_policy, same cadence as the other tools) ride
+    on the per-prompt recall output, the channel the degraded-recall notice already uses.
+    Consumed as soon as they are returned. Never raises."""
+    try:
+        from pathlib import Path
+
+        from atlaso_client import notice_policy
+        mode = client.cloud_mode() if hasattr(client, "cloud_mode") else {}
+        base = os.environ.get("ATLASO_GLOBAL_PATH") or os.path.join(os.path.expanduser("~"), ".atlaso")
+        out = []
+        for msg, ack in notice_policy.standard_notices(client, mode or {}, "Antigravity",
+                                                       Path(base) / "notice_seen_antigravity"):
+            ack()
+            out.append(msg)
+        return out
+    except Exception:
+        return []
 
 
 def _marker_path(key: str):

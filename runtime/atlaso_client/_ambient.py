@@ -27,6 +27,10 @@ from typing import Optional
 from . import config
 
 TTL = int(os.environ.get("ATLASO_AMBIENT_TTL", "900"))  # 15 min
+# A sync's best-effort refresh is skipped while the snapshot was checked with the
+# server this recently (by the session start, or an earlier sync). Each /v1/ambient
+# call counts toward the server's per-account fair share while it is busy.
+REFRESH_AFTER = 300  # 5 min
 SCRUB_VERSION = 2  # the server's brief_scrub value this client trusts
 
 
@@ -76,6 +80,26 @@ def load_status(tool: Optional[str], identity: str, ttl: int = TTL,
     except (TypeError, ValueError):
         return None, False
     return b, False
+
+
+def checked_within(tool: Optional[str], identity: str, seconds: float,
+                   *, project: Optional[str] = None) -> bool:
+    """True when THIS (tool, identity, project) snapshot was checked with the server
+    in the last ``seconds``, with or without brief text (a checked "nothing to
+    deliver" counts). A file holding unattested text is never a valid check."""
+    try:
+        obj = json.loads(_path(tool, project).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(obj, dict) or obj.get("id") != identity or obj.get("project") != project:
+        return False
+    if obj.get("block") is not None and not attested(obj.get("scrub")):
+        return False
+    try:
+        age = time.time() - float(obj.get("checked_at", 0))
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(age) and 0 <= age < seconds
 
 
 def load(tool: Optional[str], identity: str, ttl: int = TTL,

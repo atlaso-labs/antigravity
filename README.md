@@ -27,7 +27,7 @@ only accepts a local directory.
 - One memory across every AI tool you use — what Antigravity learns, Cursor, Codex, and the rest already know
 - Personal memory that follows you, plus per-project memory keyed to each repo
 - Secrets scrubbed client-side before anything is stored; your memory is never trained on or sold
-- Free for one device and one tool — no credit card ([pricing](https://www.atlaso.ai/pricing))
+- Free on every device and in every tool, with no device or tool limit ([pricing](https://www.atlaso.ai/pricing))
 
 **Links:** [Why Atlaso for Antigravity](https://www.atlaso.ai/for/antigravity) ·
 [Setup guide](https://docs.atlaso.ai/tools/antigravity) ·
@@ -159,18 +159,16 @@ The plugin's `hooks.json` registers:
   object).
 - The plugin `hooks.json` group/`enabled`/event-key schema, and SessionStart itself.
 
-## Free vs paid
+## Free on every tool and device
 
-Same as every Atlaso connector: a free plan is 1 active tool per device. The MCP
-entry sets `ATLASO_TOOL=antigravity` (literal) so the server can scope this device's
-entitlement. A revoked/non-entitled tool keeps working **locally** (never deletes
-memories) and re-links when you upgrade — that whole state machine lives in
-`atlaso_client`, reused unchanged.
+Saving, keeping and using memories, including cloud sync, is free with no device
+or tool limit. Every account gets $25.00 free credit once for Atlaso's learning.
+Manage learning credits in the dashboard's Credits tab. At zero credit, only
+learning pauses; saving and recall keep working.
 
-> Note: as of this writing the shared MCP server (`atlaso_mcp/server.py`) constructs
-> its `Client()` without forwarding `ATLASO_TOOL`, so the literal is currently
-> forward-compatible — it tags the process correctly for when the server starts
-> reading it. No behavior change is needed in this connector.
+The MCP entry sets `ATLASO_TOOL=antigravity` so the client uses this tool's own
+credential. Revoked credentials and older servers' entitlement refusals still
+fall back locally without deleting memories. They never require a paid plan.
 
 ## Layout (source tree)
 

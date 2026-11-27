@@ -1,3 +1,5 @@
+# Legacy compatibility: plan restrictions below apply only to older server responses.
+# The credits backend grants every account all tools; keep auth and refusal handling safe.
 """The thin client core — the tool-agnostic foundation every connector reuses.
 
 It does four things, and NOTHING tool-specific:
@@ -94,9 +96,15 @@ class Client:
         # out from under the machine's other integrations).
         self._cred_source: str | None = None
         self._cred_token: str | None = None
+        # Why api is None although a token exists (the tool was removed / not entitled), so
+        # cloud_mode() can explain it instead of reading as never-connected.
+        self._local_reason: str | None = None
         # Wall-clock budget for the brain half of recall(). None = per-request timeouts
         # only. The connector hook shims set _deadline.NETWORK_BUDGET_S.
         self.recall_network_budget: float | None = None
+        # client_id → created_at of the items the current push's server reply ADDED (held
+        # notes progress, see _settle_held_progress). Reset at the start of every push.
+        self._added_now: dict[str, str] = {}
         if api is not None:
             self.api = api
         elif _auto_api:
@@ -117,13 +125,20 @@ class Client:
             # The user removed this tool from this device. Go quiet — do NOT fall back
             # to the shared bearer, which would resurrect exactly what they removed.
             state.set_local_only(state.AUTH_REJECTED, tool=self.tool,
-                                 device_id=self._device_id)
+                                 device_id=self._device_id, cause=state.CAUSE_TOOL_REMOVED)
+            self._local_reason = state.CAUSE_TOOL_REMOVED
+            try:
+                from . import _reconnect
+                _reconnect.note_tool_removed(self.tool)  # never reopens the browser for it
+            except Exception:  # noqa: BLE001 - never break client construction
+                pass
             return None
         except _credential.ToolNotEntitled:
-            # Free plan, another tool holds the slot. Local-only — and NOT on the
+            # Older server restriction. Local-only — and NOT on the
             # shared bearer, which would let this tool masquerade as the entitled one.
             state.set_local_only(state.NOT_ENTITLED, tool=self.tool,
                                  device_id=self._device_id)
+            self._local_reason = state.NOT_ENTITLED
             return None
         except Exception:
             cred = None
@@ -157,6 +172,13 @@ class Client:
         ONLY if it belongs to this (tool, device_id), so one tool's local-only
         notice never shows up under another tool."""
         if self.api is None:
+            if getattr(self, "_local_reason", None):
+                # a token exists but this tool may not use it (removed / not entitled):
+                # the verdict _resolve_api just persisted explains why
+                st = state.get()
+                if state.matches(st, self.tool, self._device_id) and \
+                        st.get("mode") == state.LOCAL_ONLY:
+                    return st
             return {"mode": state.LOCAL_ONLY, "reason": state.NOT_CONNECTED,
                     "since": 0, "checked_at": 0, "active_tool": None, "grace": None}
         st = state.get()
@@ -175,8 +197,14 @@ class Client:
         if isinstance(exc, AuthRejected):
             reason = (state.RECONNECT_REQUIRED if exc.code == "reconnect_required"
                       else state.AUTH_REJECTED)
-            state.set_local_only(reason, tool=self.tool, device_id=self._device_id)
+            state.set_local_only(reason, tool=self.tool, device_id=self._device_id,
+                                 cause=exc.code, cred=self._cred_source)
             _telemetry.log("auth", "auth_rejected", code=exc.code, tool=self.tool)
+            # An expired SHARED bearer may reopen the first-run connect flow (guarded in
+            # _reconnect.due); a credential_revoked records that the user removed this tool.
+            from . import _reconnect
+            _reconnect.note_rejected(tool=self.tool, code=exc.code,
+                                     cred_source=self._cred_source, token=self._cred_token)
             # Retire ONLY the credential that was actually rejected. If this tool had
             # its own and it died (the user removed the tool, or it rotated), drop that
             # file so the next run re-bootstraps — and gets told to stay down if it was
@@ -248,18 +276,19 @@ class Client:
         tool, did = self.tool, self._device_id
         if not isinstance(ent, dict):
             return False
+        self._note_account_hint(ent.get("account_hint"))
         if ent.get("needs_reconnect"):
             state.set_local_only(state.RECONNECT_REQUIRED, tool=tool, device_id=did)
             return False
-        # Downgrade grace: the brain keeps multi-tool sync alive for a short
-        # window after a paid→free drop and reports it here so each tool can show
-        # an upgrade banner (the EXPENSIVE features are already off server-side).
+        # Older servers can still send grace. Preserve the wire shape for compatibility;
+        # notices explain free access without imposing a deadline.
         grace = None
         if ent.get("in_grace"):
             grace = {"in_grace": True, "days_left": ent.get("grace_days_left"),
                      "tools_connected": ent.get("tools_connected")}
         if ent.get("multi_tool") or not self.tool:
             state.set_linked(tool=tool, device_id=did, grace=grace)
+            self._note_linked()
             return True
         active = ent.get("active_tool")
         if active is None and not allow_claim:
@@ -278,6 +307,7 @@ class Client:
                 return False  # transient — stay local, retry verification next time
         if active == self.tool:
             state.set_linked(tool=tool, device_id=did)
+            self._note_linked()
             return True
         state.set_local_only(state.NOT_ENTITLED, active_tool=active, tool=tool, device_id=did)
         return False
@@ -301,6 +331,7 @@ class Client:
             client_id=client_id, text=text, polarity=polarity,
             evidence_grade=evidence_grade, scope_note=scope_note, tags=tags,
             tool=self.tool,  # only this tool's own verdict may send it (see _push)
+            acct=self._capture_acct(),  # identity provenance (held notes), a hash or None
         )
         if push and self._online():
             try:
@@ -838,6 +869,25 @@ class Client:
         """Best-effort refresh under the same project/tool envelope validation."""
         self.ambient(project=project, project_dir=project_dir)
 
+    def _refresh_ambient_if_due(self) -> None:
+        """sync_once's best-effort refresh, skipped while this (tool, project) snapshot
+        was checked with the server in the last _ambient.REFRESH_AFTER seconds.
+
+        The SessionStart hook fetches the brief (ambient_start) and then launches a
+        sync; without the skip that sync fetched it again at once, and so did every
+        capture-triggered sync (Antigravity syncs on every turn). Each fetch counts
+        toward the server's per-account fair share (lab review, 5 Nov 2026). Session
+        delivery is unchanged: ambient_start always revalidates online.
+        """
+        from . import _ambient
+        ident = self._ambient_identity()
+        if not ident:
+            return
+        key = self._ambient_project(_PROJECT_UNSET, None)
+        if _ambient.checked_within(self.tool, ident, _ambient.REFRESH_AFTER, project=key):
+            return
+        self.ambient(project=key)
+
     # ── sync ─────────────────────────────────────────────────────────────────
     def sync_once(self) -> dict:
         """Push the outbox, then pull new server deposits.
@@ -863,6 +913,9 @@ class Client:
         if not self._online():
             self._background_maintenance()
             return {"pushed": 0, "pulled": 0, "synced": False}
+        # Record WHICH account is linked now (hashes only): the push then sends only rows that
+        # are unstamped or stamped for this account (S1, see _push_account).
+        self._note_linked()
         try:
             pushed = len(self._push())
             pulled = self._pull()
@@ -879,13 +932,73 @@ class Client:
             _reconcile.run_if_due(self)
         except Exception:
             pass
-        # Refresh the scoped snapshot for inspection (best-effort). SessionStart
-        # still validates current server policy before emitting any brief.
+        # Refresh the scoped snapshot for inspection (best-effort), unless the session
+        # start or an earlier sync just checked it. SessionStart still validates
+        # current server policy before emitting any brief.
         try:
-            self.refresh_ambient()
+            self._refresh_ambient_if_due()
         except Exception:
             pass
         return {"pushed": pushed, "pulled": pulled, "synced": True}
+
+    def _current_acct(self) -> str | None:
+        """Identity stamp (a hash) of the account in auth.json, or None."""
+        from .cache import identity_acct
+        auth = self._ambient_auth or {}
+        return identity_acct(auth.get("server"), auth.get("user_id"))
+
+    def _note_linked(self) -> None:
+        """A verified cloud link: remember which account (hashes only). Never raises."""
+        try:
+            self.cache.record_identity((self._ambient_auth or {}).get("server"),
+                                       (self._ambient_auth or {}).get("user_id"))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _note_account_hint(self, hint: Any) -> None:
+        """Keep the server's masked account label (e.g. a•••@gmail.com, from
+        /v1/entitlement `account_hint`, when the server sends one) for the held-notes preview,
+        bound to the account it describes. Never raises; absent → nothing."""
+        try:
+            if not isinstance(hint, str):
+                return
+            clean = "".join(ch for ch in hint if ch.isprintable()).strip()[:120]
+            acct = self._current_acct()
+            if clean and acct:
+                cur = self.cache.get_meta("account_hint")
+                val = json.dumps({"acct": acct, "hint": clean})
+                if cur != val:
+                    self.cache.set_meta("account_hint", val)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _capture_acct(self) -> str | None:
+        """The identity stamp for a row queued now: the account in auth.json, ONLY when it is
+        the account this cache last verified a link to (so the stamp is evidence, not a
+        guess). Otherwise None (unproven). File/cache reads only; never raises."""
+        try:
+            cur = self._current_acct()
+            return cur if cur and cur == self.cache.linked_acct() else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _push_account(self) -> str | None:
+        """The account a push may send stamped rows to: the one in auth.json, only when it is
+        the account this cache last verified a link to. None = unstamped rows only."""
+        try:
+            cur = self._current_acct()
+            return cur if cur and cur == self.cache.linked_acct() else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _settle_held_progress(self) -> None:
+        """After a push: count the adopted rows the server ADDED, and when every adopted row has
+        settled, leave the one-time "added N notes" record for this tool's session-start notice.
+        Never raises."""
+        try:
+            self.cache.held_upload_progress(self.tool, getattr(self, "_added_now", {}) or {})
+        except Exception:  # noqa: BLE001
+            pass
 
     @staticmethod
     def _item_payload(it: dict, *, b64: bool = False) -> dict:
@@ -930,6 +1043,11 @@ class Client:
                 # "duplicate" is the SAME memory arriving again (a 93x replay must
                 # read ~0% captured, not 100%), so it lands in its own drop bucket
                 # and never inflates accepted.
+                if status == "added":
+                    # held-notes progress (atlaso held uploads): which items this push ADDED
+                    added_now = getattr(self, "_added_now", None)
+                    if isinstance(added_now, dict):
+                        added_now[cid] = (created or {}).get(cid) or ""
                 try:
                     if status == "added":
                         self.cache.add_capture_accepted_for((created or {}).get(cid), 1)
@@ -1047,8 +1165,19 @@ class Client:
         # Only rows THIS tool queued: the caller has just checked this tool's own entitlement
         # verdict, never the verdict of the tool that captured a row tagged otherwise
         # (CodeRedTeam e632b415: the cache file is shared per device). Untagged legacy rows
-        # are never sent by any tool; they stay local (CodeRedTeam a5c54add).
-        items = self.cache.list_outbox(limit=_PUSH_BATCH, tool=self.tool)
+        # are never sent as they are (CodeRedTeam a5c54add): only after the user's explicit
+        # opt-in (atlaso_client.held) gave them to this tool, stamped for the linked account.
+        # S1: and never a row stamped for ANOTHER account than the one linked now (a re-link
+        # approved as account B must not upload what was captured under A): those stay held.
+        items = self.cache.list_outbox(limit=_PUSH_BATCH, tool=self.tool,
+                                       account=self._push_account())
+        self._added_now = {}
+        try:
+            return self._push_items(items)
+        finally:
+            self._settle_held_progress()
+
+    def _push_items(self, items: list[dict]) -> dict:
         stats = self._stats_payload()
         reasserts = self._list_reasserts()
         if not items and not reasserts and not self._stats_dirty(stats):
@@ -1216,16 +1345,73 @@ class Client:
         """connected? + local counts (cached/pending/cursor) + server health (FMI,
         authoritative deposit_count) when online."""
         out = {"connected": self.connected, **self.cache.counts()}
-        # Display only: legacy rows queued by an older client are kept on this device and never
-        # uploaded, so they are not "pending" to a reader. counts() still includes them.
+        # Display only: legacy rows queued by an older client are held on this device, so they
+        # are not "pending" to a reader. counts() still includes them.
         kept = self.cache.kept_local_count()
         out["pending"] = max(0, out["pending"] - kept)
-        out["kept_on_this_device"] = kept
+        out["kept_on_this_device"] = kept  # backward-compatible bare count
+        try:
+            out["held_notes"] = self._held_report()
+        except Exception:  # noqa: BLE001 - status must always answer
+            pass
         h = self.health()
         if h:
             out["fmi"] = h.get("fmi")
             out["total"] = h.get("deposit_count")
         return out
+
+    def _held_report(self) -> dict:
+        """Held notes, in plain terms (content-free: counts and capture days only). Nothing held
+        uploads without the user's OK, so uploads_automatically is always 0.
+          count, first, last  everything held on this device, and its capture-date range
+          by_tool             older notes by the tool that saved them; other_tags: named
+                              other tools; untagged: no tool recorded
+          other_account       saved while this device was linked to a different account
+          addable             what `atlaso held` adds through THIS tool by default (the
+                              number the session reminder uses), with addable_first/last
+          needs_your_ok, how_to_add, summary"""
+        from .notice_policy import format_iso_day
+        b = self.cache.held_breakdown()
+        add = b["by_tool"].get(self.tool or "", 0)
+        lo, hi = b["by_tool_range"].get(self.tool or "", [None, None])
+        legacy = b["count"] - b["other_account"]
+        rep: dict[str, Any] = {
+            "count": b["count"],
+            "first": (b["first"] or "")[:10] or None,
+            "last": (b["last"] or "")[:10] or None,
+            "by_tool": dict(b["by_tool"]),
+            "other_tags": dict(b["other_tags"]),
+            "untagged": b["untagged"],
+            "other_account": b["other_account"],
+            "addable": add,
+            "addable_first": (lo or "")[:10] or None,
+            "addable_last": (hi or "")[:10] or None,
+            "uploads_automatically": 0,
+            "needs_your_ok": legacy,
+            "how_to_add": "atlaso held" if legacy else None,
+            # backward compatible name for rows naming no known tool
+            "stay_on_device": b["untagged"] + sum(b["other_tags"].values()),
+        }
+        if not b["count"]:
+            rep["summary"] = "No held notes on this device."
+            return rep
+        a, z = format_iso_day(b["first"]), format_iso_day(b["last"])
+        span = (f" from {a} to {z}" if a != z else f" from {a}") if a and z else ""
+        one = b["count"] == 1
+        words = [f"{b['count']} older note{'' if one else 's'}{span} "
+                 f"{'is' if one else 'are'} saved only on this device."]
+        if legacy:
+            words.append(f"{legacy} need{'s' if legacy == 1 else ''} your OK before Atlaso adds "
+                         "them to your account, because older versions didn't record which "
+                         "account a note belongs to. To add them, run: atlaso held")
+        if b["other_account"]:
+            one = b["other_account"] == 1
+            words.append(f"{b['other_account']} {'was' if one else 'were'} saved while this "
+                         "device was linked to a different Atlaso account; "
+                         f"{'it uploads' if one else 'they upload'} if you connect that "
+                         "account again.")
+        rep["summary"] = " ".join(words)
+        return rep
 
     def close(self) -> None:
         try:

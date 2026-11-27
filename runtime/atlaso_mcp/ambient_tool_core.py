@@ -28,7 +28,7 @@ MAX_RESULT_BYTES = 2560
 NOTICES = {
     "empty": "Ambient Memory has no saved notes to show for this chat yet. Use `remember` to save something worth keeping.",
     "withheld": "Ambient Memory is switched off in your Atlaso dashboard. Continue without saved context; turn it on there to load it.",
-    "not_entitled": "Ambient Memory, which loads your saved context at the start of each chat, is available on Atlaso Pro. `recall` and `remember` still work on your plan.",
+    "not_entitled": "Ambient Memory is free on every tool and device, with no device or tool limit. The server returned an older plan restriction. Continue without saved context for now; if this persists, contact support@atlaso.ai.",
     "busy": "Ambient Memory couldn't load your saved context just now. Continue without it; you can try `ambient` again in a minute.",
     "rate_limited": "Ambient Memory is limiting how often saved context loads right now. Continue without it; you can try `ambient` again in a minute.",
     "skipped_rows": "Ambient Memory left out some saved notes that couldn't be read; the rest are below.",
@@ -58,8 +58,8 @@ UPSTREAM_NOTICE = ("Ambient Memory could not load saved context because Atlaso's
 def auth_notice(cause: str | None) -> str:
     """Actionable stdio auth copy without exposing a credential or exception."""
     if cause == "not_entitled":
-        return ("ambient failed (403, not_entitled): this tool is not your active tool on the Free plan; "
-                "switch it on the dashboard's Connections page, or upgrade to Pro")
+        return ("ambient failed (403, not_entitled): the server returned an older plan restriction. "
+                "Atlaso is free with no device or tool limit; contact support@atlaso.ai if this persists")
     if cause == "reconnect_required":
         return ("ambient failed (403, reconnect_required): this tool's device is disconnected or its "
                 "credential is not tool-scoped; run `atlaso connect` to reconnect this tool")

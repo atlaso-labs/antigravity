@@ -138,8 +138,10 @@ def recent(limit: int = 10) -> dict:
 
 @mcp.tool()
 def status() -> dict:
-    """Memory status: connected?, how many stored/pending, and the health score
-    (FMI). Read-only."""
+    """Memory status: connected?, how many stored/pending, held_notes (older notes saved
+    only on this device: count, date range, and how many need the user's OK before they
+    are added to their account, with `atlaso held`), and the health score (FMI).
+    Read-only."""
     out = tools.do_status(client())
     attest.note_tool_call()
     return out

@@ -12,6 +12,14 @@ from typing import Any
 import httpx
 
 from . import _timing
+from ._capture import scrub as _scrub_secrets
+
+
+def _recall_query(query: str) -> str:
+    """The recall query as it may leave this machine: the capture scrubber's output (the
+    same detection set the brain applies to stored memory). Text with nothing to redact
+    comes back unchanged, the same object."""
+    return _scrub_secrets(query)[0]
 
 
 class AuthRejected(Exception):
@@ -108,12 +116,25 @@ def _raise(r: httpx.Response) -> None:
 _SYNC_TIMEOUT = 30.0
 
 
+def _note_accepted(r: httpx.Response) -> None:
+    """httpx response hook: OUR server (X-Atlaso-Response marker) answered an authenticated
+    call with a 2xx, so the credential was accepted. Records the time for the expired
+    sign-in rule (_reconnect.note_ok: throttled, a timestamp only). Never raises."""
+    try:
+        if 200 <= r.status_code < 300 and r.headers.get("x-atlaso-response") == "1":
+            from . import _reconnect
+            _reconnect.note_ok()
+    except Exception:  # noqa: BLE001 - bookkeeping must never break a call
+        pass
+
+
 class BrainAPI:
     def __init__(self, server: str, token: str, *, timeout: float = 8.0):
         self._client = httpx.Client(
             base_url=server.rstrip("/"),
             timeout=timeout,
             headers={"Authorization": f"Bearer {token}"},
+            event_hooks={"response": [_note_accepted]},
         )
 
     def close(self) -> None:
@@ -132,8 +153,13 @@ class BrainAPI:
         /v1/entitlement body) as `entitlement` (recall r5), so a client whose LINKED verdict
         went stale re-verifies on the recall itself instead of in a separate round trip. The
         brain's tool gate still decides whether this request is served at all. An older brain
-        ignores the header and returns no `entitlement` key."""
-        params: dict[str, Any] = {"q": query, "limit": limit}
+        ignores the header and returns no `entitlement` key.
+
+        The query is scrubbed with the capture scrubber before it goes into the URL (launch
+        tracker #18): the hooks send the whole prompt, so a pasted key or password would
+        otherwise leave the machine in the request line. A prompt with nothing to redact is
+        sent byte for byte as before. The Cursor and OpenCode connectors do the same."""
+        params: dict[str, Any] = {"q": _recall_query(query), "limit": limit}
         if project:
             params["project"] = project  # per-project scope filter
         if session:
